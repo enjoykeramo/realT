@@ -6,6 +6,9 @@ import realt.backtest.Backtester
 import realt.backtest.MarketData
 import realt.backtest.ParameterSweep
 import realt.backtest.TConfigIO
+import realt.backtest.Trainer
+import realt.core.engine.Costs
+import realt.core.ml.TradeModel
 import realt.backtest.SyntheticMarket
 import realt.core.engine.TConfig
 import realt.core.model.Symbol
@@ -20,9 +23,11 @@ realT —— A 股分时做T算法验证工具
 
 用法:
   realt config --vipdoc <通达信vipdoc目录>      保存数据目录,例如 D:\new_tdx\vipdoc
-  realt check                                  检查数据目录与数据覆盖范围
-  realt backtest [选项]                        多标的回测,输出 report.md / trades.csv / memory.csv
-  realt sweep [backtest 选项]                  参数扫描:训练区间挑参数,测试区间样本外检验,输出 sweep.md / best.properties
+  realt config --commission 0.0001 --min-commission 5   保存你券商的费率(见下方费率选项)
+  realt check                                  检查数据目录、数据覆盖范围,显示当前费率
+  realt train [选项]                           训练:学习胜率模型并选参数,输出参数包 realt-model.txt 与 train-report.md
+  realt backtest [选项]                        多标的回测,输出 report.md / trades.csv;加 --model 使用参数包
+  realt sweep [backtest 选项]                  规则参数扫描(不训练模型),输出 sweep.md / best.properties
   realt replay --symbol sh600000 --date 20250930  单只股票单日逐笔回放(看引擎每一步判断)
   realt demo [--out demo-vipdoc]               生成合成数据并跑通全流程(无实盘意义)
 
@@ -35,7 +40,15 @@ backtest 选项:
   --t-ratio 0.3                 T 仓占底仓比例
   --max-t 2                     每日最多做T次数
   --target 0.8                  目标胜率
-  --params best.properties      加载参数文件(sweep 产出),命令行参数优先
+  --model realt-model.txt       使用 train 产出的参数包(backtest / replay)
+  --params best.properties      加载规则参数文件(sweep 产出),命令行参数优先
+
+费率选项(可在 config 中保存,也可在命令中临时指定):
+  --commission 0.00025          佣金率,双向(默认 万2.5)
+  --min-commission 5            单笔最低佣金(元);免五填 0
+  --stamp 0.0005                印花税率,仅卖出(2023-08-28 起为 万5)
+  --transfer 0.00001            过户费率,双向(十万分之一)
+  --slippage 0.0002             滑点,单边(默认 万2)
   --no-breadth                  不扫描全市场宽度(更快)
   --out realt-out               输出目录
   --vipdoc <目录>               临时指定数据目录(不保存)
@@ -54,6 +67,7 @@ fun main(args: Array<String>) {
             "check" -> check(opts)
             "backtest" -> backtest(opts)
             "sweep" -> sweep(opts)
+            "train" -> train(opts)
             "replay" -> replay(opts)
             "demo" -> demo(opts)
             else -> {
@@ -89,16 +103,40 @@ private fun loadProps(): Properties {
     return p
 }
 
+private val feeKeys = listOf("commission", "min-commission", "stamp", "transfer", "slippage")
+
 private fun config(o: Map<String, String>) {
-    val dir = o["vipdoc"] ?: throw IllegalArgumentException("请提供 --vipdoc <目录>")
-    val f = File(dir)
-    require(File(f, "sh").isDirectory || File(f, "sz").isDirectory) { "$dir 下没有 sh/sz 子目录,不像是通达信 vipdoc 目录" }
     val p = loadProps()
-    p["vipdoc"] = f.absolutePath
+    o["vipdoc"]?.let { dir ->
+        val f = File(dir)
+        require(File(f, "sh").isDirectory || File(f, "sz").isDirectory) { "$dir 下没有 sh/sz 子目录,不像是通达信 vipdoc 目录" }
+        p["vipdoc"] = f.absolutePath
+    }
+    for (k in feeKeys) o[k]?.let { p[k] = it.toDouble().toString() }
+    require(o.keys.any { it == "vipdoc" || it in feeKeys }) { "请提供 --vipdoc 或费率选项" }
     homeConfig.parentFile.mkdirs()
     homeConfig.writer(Charsets.UTF_8).use { p.store(it, "realT") }
-    println("已保存: vipdoc = ${f.absolutePath}  ->  $homeConfig")
+    println("已保存到 $homeConfig")
+    p.stringPropertyNames().sorted().forEach { println("  $it = ${p.getProperty(it)}") }
 }
+
+/** 费率:命令行 > 配置文件 > 默认值 */
+private fun costs(o: Map<String, String>): Costs {
+    val p = loadProps()
+    fun v(k: String) = (o[k] ?: p.getProperty(k))?.toDouble()
+    val d = Costs()
+    return Costs(
+        commissionRate = v("commission") ?: d.commissionRate,
+        minCommission = v("min-commission") ?: d.minCommission,
+        stampDutyRate = v("stamp") ?: d.stampDutyRate,
+        transferRate = v("transfer") ?: d.transferRate,
+        slippage = v("slippage") ?: d.slippage,
+    )
+}
+
+private fun describeCosts(c: Costs) =
+    "佣金 ${Trainer.feeText(c.commissionRate)}(最低 ${c.minCommission} 元,双向) · 印花税 ${Trainer.feeText(c.stampDutyRate)}(卖出) · " +
+        "过户费 ${Trainer.feeText(c.transferRate)}(双向) · 滑点 ${Trainer.feeText(c.slippage)}(单边)"
 
 private fun reader(o: Map<String, String>): TdxReader {
     val dir = o["vipdoc"] ?: loadProps().getProperty("vipdoc")
@@ -109,6 +147,7 @@ private fun reader(o: Map<String, String>): TdxReader {
 private fun check(o: Map<String, String>) {
     val r = reader(o)
     println("数据目录: ${r.vipdoc.absolutePath}")
+    println("当前费率: ${describeCosts(costs(o))}")
     for (m in TdxReader.MARKETS) {
         val lday = File(r.vipdoc, "$m/lday").list()?.size ?: 0
         val min1 = File(r.vipdoc, "$m/minline").list()?.count { it.endsWith(".lc1") } ?: 0
@@ -154,14 +193,38 @@ private fun backtestConfig(o: Map<String, String>): BacktestConfig {
         File(f).reader(Charsets.UTF_8).use { p.load(it) }
         t = TConfigIO.fromProperties(p, t)
     }
+    val model = o["model"]?.let { TradeModel.parse(File(it).readText()) }
+    if (model != null) t = model.config
     o["t-ratio"]?.let { t = t.copy(tRatio = it.toDouble()) }
     o["max-t"]?.let { t = t.copy(maxTradesPerDay = it.toInt()) }
+    // 费率:显式指定(命令行/配置文件)优先;否则用参数包训练时的费率
+    val explicitFees = feeKeys.any { o.containsKey(it) || loadProps().containsKey(it) }
+    val c = if (model != null && !explicitFees) model.costs else costs(o)
     return BacktestConfig(
         startDate = o["start"]?.toInt() ?: 0,
         endDate = o["end"]?.toInt() ?: 99999999,
         baseValue = o["base"]?.toDouble() ?: 100_000.0,
         tConfig = t,
+        costs = c,
+        model = model,
     )
+}
+
+private fun train(o: Map<String, String>) {
+    val r = reader(o)
+    val symbols = symbolsFrom(o, r)
+    require(symbols.isNotEmpty()) { "没有可训练的股票(检查 1 分钟线是否已下载)" }
+    val out = File(o["out"] ?: "realt-model")
+    val cfg = backtestConfig(o - "model")
+    println("训练 ${symbols.size} 只股票 → ${out.absolutePath}")
+    println("费率: ${describeCosts(cfg.costs)}")
+    val data = MarketData(r, out, useBreadth = o["no-breadth"] == null, log = ::println)
+    val target = o["target"]?.toDouble() ?: 0.8
+    val res = Trainer(data, cfg, target, log = ::println).run(symbols, out)
+    println()
+    println(res.report.lineSequence().takeWhile { !it.startsWith("## 阈值") }.joinToString("\n"))
+    println("参数包: ${File(out, "realt-model.txt").absolutePath}")
+    println("训练报告: ${File(out, "train-report.md").absolutePath}")
 }
 
 private fun sweep(o: Map<String, String>) {
@@ -181,10 +244,13 @@ private fun backtest(o: Map<String, String>) {
     val symbols = symbolsFrom(o, r)
     require(symbols.isNotEmpty()) { "没有可回测的股票(检查 1 分钟线是否已下载)" }
     val out = File(o["out"] ?: "realt-out")
+    val cfg = backtestConfig(o)
     println("回测 ${symbols.size} 只股票 → ${out.absolutePath}")
+    println("费率: ${describeCosts(cfg.costs)}")
+    cfg.model?.let { println("参数包: 阈值 ${it.threshold},训练数据截止 ${it.trainEnd}(之后的日期为样本外)") }
     val data = MarketData(r, out, useBreadth = o["no-breadth"] == null, log = ::println)
     val target = o["target"]?.toDouble() ?: 0.8
-    val res = BacktestRunner(data, backtestConfig(o), target, log = ::println).run(symbols, out)
+    val res = BacktestRunner(data, cfg, target, log = ::println).run(symbols, out)
     println()
     println(res.report.markdown().lineSequence().takeWhile { !it.startsWith("## 2") && !it.startsWith("## 3") }.joinToString("\n"))
     println("完整报告: ${File(out, "report.md").absolutePath}")

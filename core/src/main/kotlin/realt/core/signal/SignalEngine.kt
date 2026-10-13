@@ -33,6 +33,8 @@ data class SignalSnapshot(
     val percentB5: Double,
     /** 近 30 分钟位移(日 ATR 单位),正为上涨 */
     val trend5: Double,
+    /** 1 分钟 RSI(6) */
+    val rsi1: Double,
     val chan: ChanPoint?,
     val note: String,
 ) {
@@ -128,7 +130,7 @@ class SignalEngine(
         return SignalSnapshot(
             sellS, sellLoc, sellConf, sellF,
             buyS, buyLoc, buyConf, buyF,
-            vwap, price, dev, pbNow, pb5, trend5, cp, notes.joinToString(";"),
+            vwap, price, dev, pbNow, pb5, trend5, if (rsi[n].isNaN()) 50.0 else rsi[n], cp, notes.joinToString(";"),
         )
     }
 }

@@ -41,8 +41,11 @@ class BacktestRunner(
         pool.awaitTermination(7, TimeUnit.DAYS)
 
         val sorted = records.sortedWith(compareBy({ it.date }, { it.symbol.id }))
-        val (gated, memory) = MemoryReplay(cfg.costs, ContextMemory(targetWinRate = targetWinRate)).run(sorted)
-        val report = Report(sorted, gated, memory, cfg.costs, targetWinRate)
+        val (gated, memory) = if (cfg.model != null) {
+            // 参数包模式:出手已由模型决定,不再叠加 L6 记忆门控
+            sorted.flatMap { r -> r.trades.map { GatedTrade(r.symbol, it, true) } } to ContextMemory()
+        } else MemoryReplay(cfg.costs, ContextMemory(targetWinRate = targetWinRate)).run(sorted)
+        val report = Report(sorted, gated, memory, cfg.costs, targetWinRate, cfg.model)
         if (outDir != null) {
             outDir.mkdirs()
             File(outDir, "report.md").writeText(report.markdown())

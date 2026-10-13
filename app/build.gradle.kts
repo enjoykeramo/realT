@@ -9,5 +9,5 @@ dependencies {
 application {
     mainClass.set("realt.app.MainKt")
     applicationName = "realt"
-    applicationDefaultJvmArgs = listOf("-Xmx2g", "-Dfile.encoding=UTF-8")
+    applicationDefaultJvmArgs = listOf("-Xmx4g", "-Dfile.encoding=UTF-8")
 }

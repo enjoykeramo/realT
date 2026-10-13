@@ -13,6 +13,7 @@ import realt.core.engine.TAction
 import realt.core.engine.TConfig
 import realt.core.engine.TEngine
 import realt.core.engine.Observer
+import realt.core.ml.TradeModel
 import realt.core.engine.TTrade
 import realt.core.engine.ActionKind
 import realt.core.indicator.Indicators
@@ -35,6 +36,18 @@ data class BacktestConfig(
     val historyDays: Int = 1,
     /** 一天至少需要多少根 1 分钟线才参与回测 */
     val minBarsPerDay: Int = 200,
+    /** 训练产出的参数包;非空时由模型决定出手 */
+    val model: TradeModel? = null,
+)
+
+/** 某只股票某个交易日回测所需的全部输入(只含当日开盘前可知的信息 + 当日分钟线) */
+class DaySetup(
+    val symbol: Symbol,
+    val date: Int,
+    val dayBars: List<Bar>,
+    val ctx: DayContext,
+    val shares: Int,
+    val history: List<Bar>,
 )
 
 /** 某只股票某一天的回测记录 */
@@ -69,14 +82,13 @@ class Backtester(
 
     private val stageDetector = StageDetector()
 
-    fun run(symbol: Symbol): List<DayRecord> {
+    /** 逐日生成回测输入;数据不足、除权日等会被跳过 */
+    fun setups(symbol: Symbol): Sequence<DaySetup> = sequence {
         val daily = data.reader.daily(symbol)
         val minutes = data.reader.minute1(symbol)
-        if (daily.size < 140 || minutes.isEmpty()) return emptyList()
+        if (daily.size < 140 || minutes.isEmpty()) return@sequence
         val days = minutes.byDay()
         val dates = days.keys.toList()
-        val out = ArrayList<DayRecord>()
-
         for ((di, date) in dates.withIndex()) {
             if (date < cfg.startDate || date > cfg.endDate) continue
             val dayBars = days[date]!!
@@ -86,17 +98,30 @@ class Backtester(
             val prevClose = before.last().close
             // 除权日:分钟线开盘与昨收差异超出涨跌停幅度,说明价格基准不一致,跳过
             if (kotlin.math.abs(dayBars.first().open / prevClose - 1) > symbol.limitPct + 0.01) continue
-
             val atrPct = Indicators.atr(before, 14).last() / prevClose
-            val regime = data.regimeBefore(date)
-            val stage = stageDetector.detect(before)
-            val ctx = DayContext(prevClose, atrPct, regime, stage)
+            val ctx = DayContext(prevClose, atrPct, data.regimeBefore(date), stageDetector.detect(before))
             val shares = ((cfg.baseValue / prevClose) / 100).toInt() * 100
             val history = (maxOf(0, di - cfg.historyDays) until di).flatMap { days[dates[it]]!! }
+            yield(DaySetup(symbol, date, dayBars, ctx, shares, history))
+        }
+    }
+
+    fun run(symbol: Symbol): List<DayRecord> {
+        val out = ArrayList<DayRecord>()
+        for (su in setups(symbol)) {
+            val date = su.date
+            val dayBars = su.dayBars
+            val ctx = su.ctx
+            val shares = su.shares
+            val prevClose = ctx.prevClose
+            val atrPct = ctx.atrPct
+            val regime = ctx.regime
+            val stage = ctx.stage
+            val history = su.history
 
             val predictor = DayTypePredictor()
             val observer = Observer(ctx, history, predictor)
-            val engines = variants.map { TEngine(it, cfg.costs, ctx, shares, null) }
+            val engines = variants.map { TEngine(it, cfg.costs, ctx, shares, null, model = cfg.model) }
             val pendings = arrayOfNulls<TAction>(engines.size)
             val preds = HashMap<Int, DayDist>()
             for (bar in dayBars) {

@@ -11,6 +11,8 @@ import realt.core.model.Bar
 import realt.core.model.Session
 import realt.core.signal.SignalEngine
 import realt.core.signal.SignalFamily
+import realt.core.ml.Features
+import realt.core.ml.TradeModel
 import realt.core.signal.SignalSnapshot
 import kotlin.math.max
 
@@ -122,8 +124,29 @@ data class TTrade(
     fun returnPct(costs: Costs): Double = netPnl(costs) / (openPrice * shares)
 }
 
-/** 某一分钟的"观察":分时形态后验 + 短线信号。与 [TConfig] 无关,可被多组参数共享。 */
-class Observation(val dist: DayDist, val sig: SignalSnapshot)
+/**
+ * 今日截至当前的分时状态(增量维护,O(1) 更新),作为模型特征的一部分。
+ * 价格类距离均以日 ATR 为单位。
+ */
+data class DayState(
+    val elapsed: Int,
+    val open: Double,
+    val high: Double,
+    val low: Double,
+    val close: Double,
+    /** 收盘在均价线之上的分钟占比 */
+    val fracAbove: Double,
+    /** 均价线近 30 分钟的位移(ATR) */
+    val vwapSlope30: Double,
+    /** 最近 5 分钟成交量 / 今日每分钟平均量 */
+    val volRatio5: Double,
+    /** 日内最高、最低点出现的时刻(占已过时间比例) */
+    val highAt: Double,
+    val lowAt: Double,
+)
+
+/** 某一分钟的"观察":分时形态后验 + 短线信号 + 分时状态。与 [TConfig] 无关,可被多组参数共享。 */
+class Observation(val dist: DayDist, val sig: SignalSnapshot, val day: DayState)
 
 /**
  * 观察者:维护当日 1 分钟线序列,计算 L3 形态后验与 L4 信号。
@@ -139,13 +162,40 @@ class Observer(
     private val todayStart = history.size
     private var prior: DayDist? = null
     val atrAbs = max(ctx.atrPct, 0.005) * ctx.prevClose
+    private val vwaps = ArrayList<Double>()
+    private val vols = ArrayList<Double>()
+    private var hi = Double.NEGATIVE_INFINITY
+    private var lo = Double.POSITIVE_INFINITY
+    private var hiIdx = 0
+    private var loIdx = 0
+    private var above = 0
+    private var volSum = 0.0
 
     fun observe(bar: Bar): Observation {
         bars += bar
         val today = bars.subList(todayStart, bars.size)
         if (prior == null) prior = predictor.prior(ctx, today.first().open)
         val dist = predictor.posterior(prior!!, ctx, today)
-        return Observation(dist, signals.evaluate(bars, atrAbs))
+        val sig = signals.evaluate(bars, atrAbs)
+
+        val i = today.size - 1
+        if (bar.high > hi) { hi = bar.high; hiIdx = i }
+        if (bar.low < lo) { lo = bar.low; loIdx = i }
+        if (bar.close > sig.vwap) above++
+        vwaps += sig.vwap
+        vols += bar.volume
+        volSum += bar.volume
+        val n = today.size
+        val v5 = (maxOf(0, n - 5) until n).sumOf { vols[it] } / minOf(5, n)
+        val day = DayState(
+            elapsed = Session.elapsed(bar.minute),
+            open = today.first().open, high = hi, low = lo, close = bar.close,
+            fracAbove = above.toDouble() / n,
+            vwapSlope30 = (sig.vwap - vwaps[maxOf(0, n - 31)]) / atrAbs,
+            volRatio5 = if (volSum > 0) v5 / (volSum / n) else 1.0,
+            highAt = hiIdx.toDouble() / n, lowAt = loIdx.toDouble() / n,
+        )
+        return Observation(dist, sig, day)
     }
 }
 
@@ -165,12 +215,15 @@ class TEngine(
     baseShares: Int,
     private val observer: Observer? = null,
     private val gate: (ContextKey) -> Boolean = { true },
+    /** 训练产出的参数包;非空时由模型胜率决定是否出手(替代规则打分与 L6 门控) */
+    private val model: TradeModel? = null,
 ) : IntradayStrategy {
     constructor(
         config: TConfig, costs: Costs, ctx: DayContext, baseShares: Int, history: List<Bar>,
         predictor: DayTypePredictor = DayTypePredictor(), signals: SignalEngine = SignalEngine(),
         gate: (ContextKey) -> Boolean = { true },
-    ) : this(config, costs, ctx, baseShares, Observer(ctx, history, predictor, signals), gate)
+        model: TradeModel? = null,
+    ) : this(config, costs, ctx, baseShares, Observer(ctx, history, predictor, signals), gate, model)
 
     var dist: DayDist = emptyMap(); private set
     var lastSignal: SignalSnapshot? = null; private set
@@ -201,21 +254,24 @@ class TEngine(
     fun decide(bar: Bar, obs: Observation): TAction? {
         dist = obs.dist
         lastSignal = obs.sig
-        if (!tradable) return null
         val sig = obs.sig
         val elapsed = Session.elapsed(bar.minute)
         val remaining = Session.MINUTES_PER_DAY - elapsed
         val px = bar.close
 
+        // 持仓中:无论何种情况都要管理离场
         val dir = openDir
         if (dir != null) {
             return manageOpen(dir, bar, sig, remaining)
         }
+        // 规则模式要求当日波动足以覆盖成本;模型模式由模型(含 atrPct 特征)自行判断
+        if (tShares <= 0 || (model == null && !tradable)) return null
 
         // ---- 开新仓 ----
         if (trades.size >= config.maxTradesPerDay) return null
         if (elapsed < config.noOpenAfterOpenMin || remaining <= config.noOpenBeforeCloseMin) return null
         if (elapsed - lastCloseElapsed < config.cooldownMin) return null
+        if (model != null) return decideByModel(bar, obs, model)
         if (dist.p(DayType.FLAT) > config.flatBlock) return null
 
         // 冲高回落的后半程等同下跌、探底回升的后半程等同上涨,一并计入方向判断
@@ -260,6 +316,43 @@ class TEngine(
         pending = action
         openKey = key
         openNote = reason
+        return action
+    }
+
+    /** 模型模式:对每个候选方向计算胜率概率,取最高且 ≥ 阈值者 */
+    private fun decideByModel(bar: Bar, obs: Observation, m: TradeModel): TAction? {
+        var best: TDirection? = null
+        var bestP = -1.0
+        for (d in Features.candidates(obs)) {
+            if (d == TDirection.SELL_FIRST && !config.allowSellFirst) continue
+            if (d == TDirection.BUY_FIRST && !config.allowBuyFirst) continue
+            val p = m.winProb(Features.extract(ctx, obs, d))
+            if (p > bestP) { bestP = p; best = d }
+        }
+        val choice = best ?: return null
+        if (bestP < m.threshold) return null
+        val sig = obs.sig
+        val note = "%s 模型胜率%.0f%% | %s | 形态:%s".format(
+            choice.label, bestP * 100, sig.note.ifEmpty { "均价偏离%.2fATR".format(sig.vwapDev) }, dist.describe())
+        return open(choice, bar, note)
+    }
+
+    /** 不经任何过滤直接按 [dir] 开仓(训练时给每个候选点打标签用) */
+    fun forceOpen(dir: TDirection, bar: Bar, obs: Observation, note: String = "候选"): TAction {
+        dist = obs.dist
+        lastSignal = obs.sig
+        return open(dir, bar, note)
+    }
+
+    private fun open(dir: TDirection, bar: Bar, note: String): TAction {
+        val fam = if (dir == TDirection.SELL_FIRST) lastSignal?.sellFamily else lastSignal?.buyFamily
+        val action = TAction(
+            if (dir == TDirection.SELL_FIRST) ActionKind.OPEN_SELL else ActionKind.OPEN_BUY,
+            bar.date, bar.minute, bar.close, tShares, note,
+        )
+        pending = action
+        openKey = ContextKey(ctx.regime.level.name, ctx.stage.top.name, dist.top(), dir, fam ?: SignalFamily.NONE)
+        openNote = note
         return action
     }
 

@@ -1,6 +1,7 @@
 package realt.backtest
 
 import realt.core.engine.TConfig
+import realt.core.ml.TradeModel
 import realt.core.engine.TTrade
 import realt.core.model.Symbol
 import java.io.File
@@ -118,52 +119,9 @@ class ParameterSweep(
 
 /** TConfig 与 properties 文件互转 */
 object TConfigIO {
-    fun toProperties(c: TConfig): Properties = Properties().apply {
-        setProperty("tRatio", c.tRatio.toString())
-        setProperty("maxTradesPerDay", c.maxTradesPerDay.toString())
-        setProperty("noOpenAfterOpenMin", c.noOpenAfterOpenMin.toString())
-        setProperty("noOpenBeforeCloseMin", c.noOpenBeforeCloseMin.toString())
-        setProperty("forceCloseBeforeCloseMin", c.forceCloseBeforeCloseMin.toString())
-        setProperty("entryThreshold", c.entryThreshold.toString())
-        setProperty("exitThreshold", c.exitThreshold.toString())
-        setProperty("takeProfitAtr", c.takeProfitAtr.toString())
-        setProperty("stopLossAtr", c.stopLossAtr.toString())
-        setProperty("momentumBlock", c.momentumBlock.toString())
-        setProperty("minEdgePct", c.minEdgePct.toString())
-        setProperty("edgeCostMultiple", c.edgeCostMultiple.toString())
-        setProperty("trendBlock", c.trendBlock.toString())
-        setProperty("flatBlock", c.flatBlock.toString())
-        setProperty("maxHoldMin", c.maxHoldMin.toString())
-        setProperty("regimeExit", c.regimeExit.toString())
-        setProperty("cooldownMin", c.cooldownMin.toString())
-        setProperty("allowSellFirst", c.allowSellFirst.toString())
-        setProperty("allowBuyFirst", c.allowBuyFirst.toString())
-    }
+    fun toProperties(c: TConfig): Properties =
+        Properties().apply { TradeModel.configMap(c).forEach { (k, v) -> setProperty(k, v) } }
 
-    fun fromProperties(p: Properties, base: TConfig = TConfig()): TConfig {
-        fun d(k: String, v: Double) = p.getProperty(k)?.toDouble() ?: v
-        fun i(k: String, v: Int) = p.getProperty(k)?.toInt() ?: v
-        fun b(k: String, v: Boolean) = p.getProperty(k)?.toBoolean() ?: v
-        return TConfig(
-            tRatio = d("tRatio", base.tRatio),
-            maxTradesPerDay = i("maxTradesPerDay", base.maxTradesPerDay),
-            noOpenAfterOpenMin = i("noOpenAfterOpenMin", base.noOpenAfterOpenMin),
-            noOpenBeforeCloseMin = i("noOpenBeforeCloseMin", base.noOpenBeforeCloseMin),
-            forceCloseBeforeCloseMin = i("forceCloseBeforeCloseMin", base.forceCloseBeforeCloseMin),
-            entryThreshold = d("entryThreshold", base.entryThreshold),
-            exitThreshold = d("exitThreshold", base.exitThreshold),
-            takeProfitAtr = d("takeProfitAtr", base.takeProfitAtr),
-            stopLossAtr = d("stopLossAtr", base.stopLossAtr),
-            momentumBlock = d("momentumBlock", base.momentumBlock),
-            minEdgePct = d("minEdgePct", base.minEdgePct),
-            edgeCostMultiple = d("edgeCostMultiple", base.edgeCostMultiple),
-            trendBlock = d("trendBlock", base.trendBlock),
-            flatBlock = d("flatBlock", base.flatBlock),
-            maxHoldMin = i("maxHoldMin", base.maxHoldMin),
-            regimeExit = b("regimeExit", base.regimeExit),
-            cooldownMin = i("cooldownMin", base.cooldownMin),
-            allowSellFirst = b("allowSellFirst", base.allowSellFirst),
-            allowBuyFirst = b("allowBuyFirst", base.allowBuyFirst),
-        )
-    }
+    fun fromProperties(p: Properties, base: TConfig = TConfig()): TConfig =
+        TradeModel.configFrom(p.stringPropertyNames().associateWith { p.getProperty(it) }, base)
 }

@@ -4,6 +4,7 @@ import realt.core.daytype.DayType
 import realt.core.engine.Costs
 import realt.core.engine.TTrade
 import realt.core.learn.ContextMemory
+import realt.core.ml.TradeModel
 import realt.core.model.Symbol
 
 /** 一组做T的统计 */
@@ -46,6 +47,7 @@ class Report(
     private val memory: ContextMemory,
     private val costs: Costs,
     private val target: Double,
+    private val model: TradeModel? = null,
 ) {
     private val totalDays = records.size
     private val raw = records.flatMap { r -> r.trades.map { r.symbol to it } }
@@ -60,17 +62,29 @@ class Report(
         appendLine()
         appendLine("- 标的数:${symbols.size}  交易日:${dates.firstOrNull() ?: "-"} ~ ${dates.lastOrNull() ?: "-"}  个股·日样本:$totalDays")
         appendLine("- 目标:出手胜率 ≥ ${pct(target)} 且扣费后期望为正")
-        appendLine("- 成交假设:信号出现后下一根 1 分钟线开盘价成交,单边滑点 ${pct(costs.slippage, 2)};佣金 ${costs.commissionRate * 10000} 万(最低 ${costs.minCommission} 元),卖出印花税 ${costs.stampDutyRate * 10000} 万")
+        appendLine("- 成交假设:信号出现后下一根 1 分钟线开盘价成交,单边滑点 ${Trainer.feeText(costs.slippage)}")
+        appendLine("- 费率:佣金 ${Trainer.feeText(costs.commissionRate)}(双向,单笔最低 ${costs.minCommission} 元),印花税 ${Trainer.feeText(costs.stampDutyRate)}(仅卖出),过户费 ${Trainer.feeText(costs.transferRate)}(双向);一次完整做T(一买一卖)合计约 ${pct(costs.roundTripRate - 2 * costs.slippage, 3)} + 滑点 ${pct(2 * costs.slippage, 2)}")
         appendLine()
         appendLine("## 1. 总体对比")
         appendLine()
         appendLine("| 策略 | 做T次数 | 胜率 | 平均每次(bp) | 净盈亏(元) | 最大单笔亏损 | 盈亏比 | 出手日占比 | 达标 |")
         appendLine("|---|---|---|---|---|---|---|---|---|")
         row("原型规则(对照)", TStats.of(base, costs))
-        row("realT 无记忆", TStats.of(raw, costs))
-        row("realT + L6 记忆", TStats.of(taken, costs))
-        appendLine()
-        appendLine("> 「realT + L6 记忆」是最终形态:按时间顺序在线学习,只在历史胜率达标的上下文出手。")
+        if (model == null) {
+            row("realT 无记忆", TStats.of(raw, costs))
+            row("realT + L6 记忆", TStats.of(taken, costs))
+            appendLine()
+            appendLine("> 「realT + L6 记忆」:按时间顺序在线学习,只在历史胜率达标的上下文出手。")
+            appendLine("> 未加载参数包。建议先 `realt train` 训练,再 `realt backtest --model` 回测。")
+        } else {
+            val end = model.trainEnd
+            row("realT 参数包 · 全部", TStats.of(raw, costs))
+            row("realT 参数包 · 样本内 ≤ $end", TStats.of(raw.filter { it.second.date <= end }, costs), records.count { it.date <= end })
+            row("**realT 参数包 · 样本外 > $end**", TStats.of(raw.filter { it.second.date > end }, costs), records.count { it.date > end })
+            appendLine()
+            appendLine("> 参数包训练数据截止 $end。**只有样本外一行代表真实能力**,样本内结果会偏乐观。")
+            appendLine("> 出手阈值 ${model.threshold},止盈 ${model.config.takeProfitAtr} ATR,止损 ${model.config.stopLossAtr} ATR。")
+        }
         appendLine()
 
         if (dates.size >= 20) {
