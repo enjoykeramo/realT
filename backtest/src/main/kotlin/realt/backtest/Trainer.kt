@@ -7,11 +7,9 @@ import realt.core.engine.TAction
 import realt.core.engine.TConfig
 import realt.core.engine.TDirection
 import realt.core.engine.TEngine
-import realt.core.engine.TTrade
 import realt.core.ml.Features
 import realt.core.ml.Gbdt
 import realt.core.ml.TradeModel
-import realt.core.model.Bar
 import realt.core.model.Session
 import realt.core.model.Symbol
 import java.io.File
@@ -19,15 +17,14 @@ import java.util.Collections
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.max
 import kotlin.math.sqrt
 
 /**
  * 训练:用历史分时数据学习"什么情况下做T能赢",输出参数包。
  *
  * 1. 候选生成:逐分钟回放,每出现一个转折结构(缠论/布林/RSI)就记一个候选点及其全部特征。
- * 2. 打标签:对每个候选点、每组离场参数,用与实盘完全相同的离场逻辑模拟这一笔,扣全部费用后盈利为 1。
- *    同时记录"允许隔日回补"时的结果(诊断用,不进参数包)。
+ * 2. 打标签:对每个候选点、每组离场参数,用与实盘完全相同的离场逻辑模拟这一笔(当日必须完成),
+ *    扣全部费用后盈利为 1。
  * 3. 滚动前推(walk-forward):前 40% 交易日作为起始训练期,其余分成 [folds] 段;
  *    每段都只用它之前的数据训练模型并预测它 → 得到大量"样本外预测"。
  *    最后一段是最终测试集;其余各段的样本外预测用来挑选离场参数与出手阈值(交易笔数远多于单一验证集,结论更稳)。
@@ -44,7 +41,7 @@ class Trainer(
     private val threads: Int = Runtime.getRuntime().availableProcessors().coerceIn(1, 8),
     private val log: (String) -> Unit = {},
 ) {
-    /** 候选点:特征 + 每组离场参数下的结果(pnl 当日回补,carry 允许隔日回补) */
+    /** 候选点:特征 + 每组离场参数下的结果(均为当日完成的T) */
     class Cand(
         val symbol: Symbol,
         val date: Int,
@@ -52,7 +49,7 @@ class Trainer(
         val dir: TDirection,
         val x: DoubleArray,
         val pnl: DoubleArray,
-        val carry: DoubleArray,
+        val reason: Array<CloseReason?>,
         val closeE: IntArray,
     )
 
@@ -162,8 +159,6 @@ class Trainer(
         val pTest = test.map { oofP[ch.k][it] ?: 0.0 }
         val testEval = simulate(test, pTest, ch.k, ch.thr, ec)
         val testAll = simulate(test, pTest, ch.k, 0.0, ec)
-        val selCarry = simulate(sel, pSel, ch.k, ch.thr, ec, carry = true)
-        val testCarry = simulate(test, pTest, ch.k, ch.thr, ec, carry = true)
         log("第 3 步:选定 止盈${ec.takeProfitAtr}ATR 止损${ec.stopLossAtr}ATR 阈值${ch.thr}")
         log("  选择段:${ch.e.n} 笔 胜率 ${pct(ch.e.winRate)}(95%置信 ${pct(ch.e.winLow)}~${pct(ch.e.winHigh)})净盈亏 ${f0(ch.e.pnl)}")
         log("  测试段:${testEval.n} 笔 胜率 ${pct(testEval.winRate)}(95%置信 ${pct(testEval.winLow)}~${pct(testEval.winHigh)})净盈亏 ${f0(testEval.pnl)}")
@@ -183,10 +178,10 @@ class Trainer(
             val losers = taken.filter { it.pnl[ch.k] <= 0 }
             lossReasons.appendLine("出手 ${taken.size} 笔中亏损 ${losers.size} 笔:")
             lossReasons.appendLine()
-            lossReasons.appendLine("| 方向 | 亏损笔数 | 平均亏损(元) | 若允许隔日回补可转盈 |")
+            lossReasons.appendLine("| 方向 | 平仓原因 | 亏损笔数 | 平均亏损(元) |")
             lossReasons.appendLine("|---|---|---|---|")
-            for ((d, g) in losers.groupBy { it.dir }) {
-                lossReasons.appendLine("| ${d.label} | ${g.size} | ${f0(g.map { it.pnl[ch.k] }.average())} | ${g.count { it.carry[ch.k] > 0 }} |")
+            for ((key, g) in losers.groupBy { it.dir.label to (it.reason[ch.k]?.label ?: "-") }.toSortedMap(compareBy({ it.first }, { it.second }))) {
+                lossReasons.appendLine("| ${key.first} | ${key.second} | ${g.size} | ${f0(g.map { it.pnl[ch.k] }.average())} |")
             }
         }
 
@@ -243,17 +238,6 @@ class Trainer(
             appendLine("## 亏损单分析")
             appendLine()
             append(lossReasons)
-            appendLine()
-            appendLine("## 诊断:如果允许隔日回补")
-            appendLine()
-            appendLine("当日没能按目标价完成、尾盘被迫收尾的T,若允许次日继续按同样止盈止损完成,同一批出手的结果:")
-            appendLine()
-            appendLine("| 数据段 | 次数 | 当日回补胜率 | 允许隔日回补胜率 | 允许隔日回补净盈亏 |")
-            appendLine("|---|---|---|---|---|")
-            appendLine("| 选择段 | ${selCarry.n} | ${pct(ch.e.winRate)} | ${pct(selCarry.winRate)} | ${f0(selCarry.pnl)} |")
-            appendLine("| 测试段 | ${testCarry.n} | ${pct(testEval.winRate)} | ${pct(testCarry.winRate)} | ${f0(testCarry.pnl)} |")
-            appendLine()
-            appendLine("隔日回补会让持股数在隔夜期间偏离底仓(先卖后买时少、先买后卖时多),参数包目前不启用,仅供决策参考。")
             appendLine()
             appendLine("## 最重要的特征(各段模型累计)")
             appendLine()
@@ -313,11 +297,11 @@ class Trainer(
         return out
     }
 
-    private fun simulate(cs: List<Cand>, p: List<Double>, k: Int, thr: Double, ec: TConfig, carry: Boolean = false): Eval {
+    private fun simulate(cs: List<Cand>, p: List<Double>, k: Int, thr: Double, ec: TConfig): Eval {
         var n = 0; var wins = 0; var pnl = 0.0; var sumRet = 0.0
         val notional = cfg.baseValue * ec.tRatio
         for (c in takenTrades(cs, p, k, thr, ec)) {
-            val v = if (carry) c.carry[k] else c.pnl[k]
+            val v = c.pnl[k]
             n++
             if (v > 0) wins++
             pnl += v
@@ -333,25 +317,22 @@ class Trainer(
         val obs = ArrayList<Observation>(bars.size)
         for (b in bars) obs += observer.observe(b)
         if ((su.shares * grid[0].tRatio / 100).toInt() <= 0) return emptyList()
-        val atrAbs = max(su.ctx.atrPct, 0.005) * su.ctx.prevClose
 
         val out = ArrayList<Cand>()
         for (i in bars.indices) {
             val el = Session.elapsed(bars[i].minute)
             if (el < grid[0].noOpenAfterOpenMin || Session.MINUTES_PER_DAY - el <= grid[0].noOpenBeforeCloseMin) continue
             for (dir in Features.candidates(obs[i])) {
-                val pnl = DoubleArray(grid.size); val carry = DoubleArray(grid.size)
+                val pnl = DoubleArray(grid.size); val reason = arrayOfNulls<CloseReason>(grid.size)
                 val ce = IntArray(grid.size)
                 for ((k, g) in grid.withIndex()) {
                     val e = TEngine(g, cfg.costs, su.ctx, su.shares, null)
                     var pending: TAction? = e.forceOpen(dir, bars[i], obs[i])
                     var j = i + 1
-                    var timeBar = -1
                     while (j < bars.size && e.trades.isEmpty()) {
                         pending?.let { fill(e, it, bars[j].open, bars[j].minute) }
                         if (e.trades.isNotEmpty()) break
                         pending = e.decide(bars[j], obs[j])
-                        if (pending?.closeReason == CloseReason.TIME && timeBar < 0) timeBar = j
                         j++
                     }
                     val last = bars.last()
@@ -362,34 +343,12 @@ class Trainer(
                     val t = e.trades.firstOrNull() ?: continue
                     pnl[k] = t.netPnl(cfg.costs)
                     ce[k] = Session.elapsed(t.closeMinute)
-                    val next = su.nextBars
-                    carry[k] = if (t.closeReason == CloseReason.TIME && next != null && timeBar >= 0)
-                        carryPnl(t, bars.subList(timeBar + 1, bars.size) + next, g, atrAbs)
-                    else pnl[k]
+                    reason[k] = t.closeReason
                 }
-                out += Cand(su.symbol, su.date, el, dir, Features.extract(su.ctx, obs[i], dir), pnl, carry, ce)
+                out += Cand(su.symbol, su.date, el, dir, Features.extract(su.ctx, obs[i], dir), pnl, reason, ce)
             }
         }
         return out
-    }
-
-    /** 隔日回补:从被迫收尾处继续,按同样的止盈止损走到次日收盘 */
-    private fun carryPnl(t: TTrade, rest: List<Bar>, g: TConfig, atrAbs: Double): Double {
-        val sell = t.direction == TDirection.SELL_FIRST
-        val slip = cfg.costs.slippage
-        var exit = Double.NaN
-        for (j in rest.indices) {
-            val b = rest[j]
-            val gain = if (sell) t.openPrice - b.close else b.close - t.openPrice
-            val adverse = if (sell) b.high - t.openPrice else t.openPrice - b.low
-            if (adverse >= g.stopLossAtr * atrAbs || gain >= g.takeProfitAtr * atrAbs) {
-                exit = rest.getOrNull(j + 1)?.open ?: b.close
-                break
-            }
-        }
-        if (exit.isNaN()) exit = rest.last().close
-        val px = if (sell) exit * (1 + slip) else exit * (1 - slip)
-        return t.copy(closePrice = px).netPnl(cfg.costs)
     }
 
     private fun fill(e: TEngine, a: TAction, px: Double, minute: Int) {

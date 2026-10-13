@@ -30,7 +30,7 @@ enum class ActionKind(val label: String) {
 }
 
 enum class CloseReason(val label: String) {
-    TARGET("止盈"), VWAP("回归均价"), SIGNAL("反向信号"), BREAKEVEN("保本离场"),
+    TARGET("止盈"), VWAP("回归均价"), SIGNAL("反向信号"), BREAKEVEN("保本离场"), LATE_LOCK("尾盘锁利"),
     STOP("止损认错"), REGIME_FLIP("形态逆转"), TIME("尾盘收尾"),
 }
 
@@ -87,6 +87,8 @@ data class TConfig(
     val flatBlock: Double = 0.45,
     /** 持有超过该分钟数仍无进展,且盘面偏向不利单边时离场 */
     val maxHoldMin: Int = 90,
+    /** 收盘前多少分钟进入"尾盘锁利":只要扣费后有盈利就立即完成T,不再等止盈;0 关闭 */
+    val lateLockMin: Int = 30,
     /** 是否启用形态逆转/时间止损离场(默认关闭,用 sweep 在真实数据上检验) */
     val regimeExit: Boolean = false,
     /** 平仓后冷却分钟数 */
@@ -430,6 +432,8 @@ class TEngine(
             gain >= minEdge && (if (sell) sig.buyScore else sig.sellScore) >= config.exitThreshold -> CloseReason.SIGNAL
             // 保本:曾经浮盈超过 2 倍 minEdge,回吐到只剩 minEdge/2 时离场,不让盈利单变亏损单
             maxGain >= 2 * minEdge && gain <= minEdge * 0.5 -> CloseReason.BREAKEVEN
+            // 当日T必须当日完成:临近收盘,只要已覆盖成本就落袋,避免被迫按尾盘价收尾
+            remaining <= config.lateLockMin && gain >= costs.roundTripRate * 1.2 -> CloseReason.LATE_LOCK
             // 时间止损:持有过久且已亏损,盘面明显偏向不利的单边
             config.regimeExit && held >= config.maxHoldMin && gain < -minEdge * 0.5 && oppTrend > 0.6 -> CloseReason.REGIME_FLIP
             // 形态被确认为与持仓相反的单边:立即认错

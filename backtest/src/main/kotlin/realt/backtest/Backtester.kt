@@ -52,8 +52,6 @@ class DaySetup(
     /** 参考指数当日 1 分钟线与昨收(可为空) */
     val indexBars: List<Bar> = emptyList(),
     val indexPrevClose: Double = 0.0,
-    /** 下一个交易日的 1 分钟线(训练时评估"隔日回补"用;除权或无数据为 null) */
-    val nextBars: List<Bar>? = null,
 ) {
     fun observer(predictor: DayTypePredictor = DayTypePredictor()) =
         Observer(ctx, history, predictor, indexBars = indexBars, indexPrevClose = indexPrevClose)
@@ -115,9 +113,7 @@ class Backtester(
             val shares = ((cfg.baseValue / prevClose) / 100).toInt() * 100
             val history = (maxOf(0, di - cfg.historyDays) until di).flatMap { days[dates[it]]!! }
             val (idxBars, idxPrev) = data.indexDay(symbol, date)
-            val next = dates.getOrNull(di + 1)?.let { days[it] }
-                ?.takeIf { it.size >= cfg.minBarsPerDay && kotlin.math.abs(it.first().open / dayBars.last().close - 1) <= symbol.limitPct + 0.01 }
-            yield(DaySetup(symbol, date, dayBars, ctx, shares, history, idxBars, idxPrev, next))
+            yield(DaySetup(symbol, date, dayBars, ctx, shares, history, idxBars, idxPrev))
         }
     }
 
