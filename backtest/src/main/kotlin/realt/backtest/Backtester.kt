@@ -14,6 +14,7 @@ import realt.core.engine.TConfig
 import realt.core.engine.TEngine
 import realt.core.engine.Observer
 import realt.core.ml.TradeModel
+import realt.core.ml.DailyFeatures
 import realt.core.engine.TTrade
 import realt.core.engine.ActionKind
 import realt.core.indicator.Indicators
@@ -48,7 +49,15 @@ class DaySetup(
     val ctx: DayContext,
     val shares: Int,
     val history: List<Bar>,
-)
+    /** 参考指数当日 1 分钟线与昨收(可为空) */
+    val indexBars: List<Bar> = emptyList(),
+    val indexPrevClose: Double = 0.0,
+    /** 下一个交易日的 1 分钟线(训练时评估"隔日回补"用;除权或无数据为 null) */
+    val nextBars: List<Bar>? = null,
+) {
+    fun observer(predictor: DayTypePredictor = DayTypePredictor()) =
+        Observer(ctx, history, predictor, indexBars = indexBars, indexPrevClose = indexPrevClose)
+}
 
 /** 某只股票某一天的回测记录 */
 data class DayRecord(
@@ -99,10 +108,16 @@ class Backtester(
             // 除权日:分钟线开盘与昨收差异超出涨跌停幅度,说明价格基准不一致,跳过
             if (kotlin.math.abs(dayBars.first().open / prevClose - 1) > symbol.limitPct + 0.01) continue
             val atrPct = Indicators.atr(before, 14).last() / prevClose
-            val ctx = DayContext(prevClose, atrPct, data.regimeBefore(date), stageDetector.detect(before))
+            val ctx = DayContext(
+                prevClose, atrPct, data.regimeBefore(date), stageDetector.detect(before),
+                symbol.limitPct, DailyFeatures.compute(before),
+            )
             val shares = ((cfg.baseValue / prevClose) / 100).toInt() * 100
             val history = (maxOf(0, di - cfg.historyDays) until di).flatMap { days[dates[it]]!! }
-            yield(DaySetup(symbol, date, dayBars, ctx, shares, history))
+            val (idxBars, idxPrev) = data.indexDay(symbol, date)
+            val next = dates.getOrNull(di + 1)?.let { days[it] }
+                ?.takeIf { it.size >= cfg.minBarsPerDay && kotlin.math.abs(it.first().open / dayBars.last().close - 1) <= symbol.limitPct + 0.01 }
+            yield(DaySetup(symbol, date, dayBars, ctx, shares, history, idxBars, idxPrev, next))
         }
     }
 
@@ -120,7 +135,7 @@ class Backtester(
             val history = su.history
 
             val predictor = DayTypePredictor()
-            val observer = Observer(ctx, history, predictor)
+            val observer = su.observer(predictor)
             val engines = variants.map { TEngine(it, cfg.costs, ctx, shares, null, model = cfg.model) }
             val pendings = arrayOfNulls<TAction>(engines.size)
             val preds = HashMap<Int, DayDist>()

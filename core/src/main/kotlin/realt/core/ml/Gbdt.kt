@@ -122,7 +122,7 @@ class Gbdt(val base: Double, val learningRate: Double, val trees: List<Tree>) {
                     grad[i] = pr - y[i]
                     hess[i] = maxOf(pr * (1 - pr), 1e-6)
                 }
-                val rows = (0 until n).filter { rnd.nextDouble() < p.rowSample }.toIntArray()
+                val rows = sampleRows(n, p.rowSample, rnd)
                 val cols = (0 until nf).filter { rnd.nextDouble() < p.colSample }.ifEmpty { listOf(rnd.nextInt(nf)) }.toIntArray()
                 val tree = TreeBuilder(binned, edges, grad, hess, cols, p, importance).build(rows)
                 trees += tree
@@ -142,6 +142,13 @@ class Gbdt(val base: Double, val learningRate: Double, val trees: List<Tree>) {
             }
             val kept = if (vx.isNotEmpty() && bestCount > 0) trees.subList(0, bestCount).toList() else trees
             return Gbdt(base, p.learningRate, kept).also { it.importance = importance }
+        }
+
+        private fun sampleRows(n: Int, ratio: Double, rnd: Random): IntArray {
+            val buf = IntArray(n)
+            var m = 0
+            for (i in 0 until n) if (rnd.nextDouble() < ratio) buf[m++] = i
+            return buf.copyOf(m)
         }
 
         private fun binOf(e: DoubleArray, v: Double): Int {
@@ -211,8 +218,11 @@ class Gbdt(val base: Double, val learningRate: Double, val trees: List<Tree>) {
             if (bestF < 0) return id
             importance[bestF] += bestGain
             val col = binned[bestF]
-            val l = rows.filter { (col[it].toInt() and 0xFF) <= bestBin }.toIntArray()
-            val r = rows.filter { (col[it].toInt() and 0xFF) > bestBin }.toIntArray()
+            var nl = 0
+            for (x in rows) if ((col[x].toInt() and 0xFF) <= bestBin) nl++
+            val l = IntArray(nl); val r = IntArray(rows.size - nl)
+            var li0 = 0; var ri0 = 0
+            for (x in rows) if ((col[x].toInt() and 0xFF) <= bestBin) l[li0++] = x else r[ri0++] = x
             feature[id] = bestF
             threshold[id] = edges[bestF][bestBin]
             val li = node(l, depth + 1)

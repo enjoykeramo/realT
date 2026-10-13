@@ -30,6 +30,14 @@ object Features {
         "pos120", "ret20", "ret60", "dd20", "vr", "bwPct", "maUp",
         // 个股波动
         "atrPct",
+        // 量价微观结构
+        "flow15S", "rv30",
+        // 指数分时(同一分钟)与相对强弱
+        "hasIndex", "idxRetS", "idxVsVwapS", "idxSlope30S", "relStrengthS",
+        // 涨跌停距离(ATR):逆向一侧(先卖时为涨停)/ 同向一侧
+        "toLimitAgainst", "toLimitWith",
+        // 昨日及日线位置
+        "yRetS", "yClosePosS", "yRangeAtr", "y2RetS", "toMa5S", "toMa20S", "yVolRatio", "upDays5S",
     )
 
     val size: Int get() = names.size
@@ -50,6 +58,7 @@ object Features {
         val f = ctx.stage.features
         val st = ctx.stage.probs
         fun nz(x: Double) = if (x.isNaN()) 0.5 else x
+        fun dl(k: String, v: Double) = ctx.daily[k] ?: v
 
         return doubleArrayOf(
             if (sell) 1.0 else 0.0,
@@ -88,6 +97,14 @@ object Features {
             f["pos120"] ?: 0.5, f["ret20"] ?: 0.0, f["ret60"] ?: 0.0, f["dd20"] ?: 0.0,
             f["vr"] ?: 1.0, f["bwPct"] ?: 0.5, f["maUp"] ?: 0.5,
             ctx.atrPct,
+            s * day.flow15, day.rv30,
+            if (day.hasIndex) 1.0 else 0.0, s * day.idxRet, s * day.idxVsVwap, s * day.idxSlope30,
+            if (day.hasIndex) s * ((day.close / ctx.prevClose - 1) * 100 - day.idxRet) else 0.0,
+            (if (sell) ctx.prevClose * (1 + ctx.limitPct) - day.close else day.close - ctx.prevClose * (1 - ctx.limitPct)) / atr,
+            (if (sell) day.close - ctx.prevClose * (1 - ctx.limitPct) else ctx.prevClose * (1 + ctx.limitPct) - day.close) / atr,
+            s * dl("yRetAtr", 0.0), if (sell) dl("yClosePos", 0.5) else 1 - dl("yClosePos", 0.5),
+            dl("yRangeAtr", 1.0), s * dl("y2RetAtr", 0.0), s * dl("toMa5Atr", 0.0), s * dl("toMa20Atr", 0.0),
+            dl("yVolRatio", 1.0), if (sell) dl("upDays5", 2.5) else 5 - dl("upDays5", 2.5),
         )
     }
 

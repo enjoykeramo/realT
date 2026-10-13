@@ -143,6 +143,16 @@ data class DayState(
     /** 日内最高、最低点出现的时刻(占已过时间比例) */
     val highAt: Double,
     val lowAt: Double,
+    /** 近 15 分钟 (上涨分钟成交量 - 下跌分钟成交量) / 总量,-1..1 */
+    val flow15: Double = 0.0,
+    /** 近 30 分钟 1 分钟收益的标准差 × √240 / 日 ATR(短期波动是否放大) */
+    val rv30: Double = 0.0,
+    /** 指数(同一分钟):相对昨收涨跌 %、相对其均价线 %、近 30 分钟涨跌 %;无指数分钟数据时为 0 */
+    val idxRet: Double = 0.0,
+    val idxVsVwap: Double = 0.0,
+    val idxSlope30: Double = 0.0,
+    /** 是否有指数分钟数据 */
+    val hasIndex: Boolean = false,
 )
 
 /** 某一分钟的"观察":分时形态后验 + 短线信号 + 分时状态。与 [TConfig] 无关,可被多组参数共享。 */
@@ -157,7 +167,15 @@ class Observer(
     history: List<Bar>,
     private val predictor: DayTypePredictor = DayTypePredictor(),
     private val signals: SignalEngine = SignalEngine(),
+    /** 当日指数 1 分钟线(可为空);只会读取不晚于当前分钟的部分 */
+    private val indexBars: List<Bar> = emptyList(),
+    /** 指数昨收 */
+    private val indexPrevClose: Double = 0.0,
 ) {
+    private var idxPtr = 0
+    private var idxPv = 0.0
+    private var idxV = 0.0
+    private val idxCloses = ArrayList<Double>()
     private val bars = ArrayList<Bar>(history)
     private val todayStart = history.size
     private var prior: DayDist? = null
@@ -187,6 +205,28 @@ class Observer(
         volSum += bar.volume
         val n = today.size
         val v5 = (maxOf(0, n - 5) until n).sumOf { vols[it] } / minOf(5, n)
+        // 资金流向近似:近 15 分钟上涨/下跌分钟的成交量差
+        var up = 0.0; var dn = 0.0
+        for (k in maxOf(0, n - 15) until n) {
+            val b = today[k]
+            if (b.close > b.open) up += b.volume else if (b.close < b.open) dn += b.volume
+        }
+        var ss = 0.0; var cnt = 0
+        for (k in maxOf(1, n - 30) until n) {
+            val r = today[k].close / today[k - 1].close - 1
+            ss += r * r; cnt++
+        }
+        val rv = if (cnt > 1) kotlin.math.sqrt(ss / cnt * 240) / ctx.atrPct.coerceAtLeast(0.005) else 0.0
+        // 指数:推进到当前分钟(不看未来)
+        while (idxPtr < indexBars.size && indexBars[idxPtr].minute <= bar.minute) {
+            val ib = indexBars[idxPtr]
+            idxPv += (ib.high + ib.low + ib.close) / 3 * ib.volume
+            idxV += ib.volume
+            idxCloses += ib.close
+            idxPtr++
+        }
+        val hasIdx = idxCloses.isNotEmpty() && indexPrevClose > 0
+        val ic = if (hasIdx) idxCloses.last() else 0.0
         val day = DayState(
             elapsed = Session.elapsed(bar.minute),
             open = today.first().open, high = hi, low = lo, close = bar.close,
@@ -194,6 +234,12 @@ class Observer(
             vwapSlope30 = (sig.vwap - vwaps[maxOf(0, n - 31)]) / atrAbs,
             volRatio5 = if (volSum > 0) v5 / (volSum / n) else 1.0,
             highAt = hiIdx.toDouble() / n, lowAt = loIdx.toDouble() / n,
+            flow15 = if (up + dn > 0) (up - dn) / (up + dn) else 0.0,
+            rv30 = rv,
+            idxRet = if (hasIdx) (ic / indexPrevClose - 1) * 100 else 0.0,
+            idxVsVwap = if (hasIdx && idxV > 0) (ic / (idxPv / idxV) - 1) * 100 else 0.0,
+            idxSlope30 = if (hasIdx) (ic / idxCloses[maxOf(0, idxCloses.size - 31)] - 1) * 100 else 0.0,
+            hasIndex = hasIdx,
         )
         return Observation(dist, sig, day)
     }
@@ -223,7 +269,12 @@ class TEngine(
         predictor: DayTypePredictor = DayTypePredictor(), signals: SignalEngine = SignalEngine(),
         gate: (ContextKey) -> Boolean = { true },
         model: TradeModel? = null,
-    ) : this(config, costs, ctx, baseShares, Observer(ctx, history, predictor, signals), gate, model)
+        indexBars: List<Bar> = emptyList(),
+        indexPrevClose: Double = 0.0,
+    ) : this(config, costs, ctx, baseShares, Observer(ctx, history, predictor, signals, indexBars, indexPrevClose), gate, model)
+
+    /** 当前持仓(方向, 开仓价);无持仓为 null */
+    val position: Pair<TDirection, Double>? get() = openDir?.let { it to openPrice }
 
     var dist: DayDist = emptyMap(); private set
     var lastSignal: SignalSnapshot? = null; private set

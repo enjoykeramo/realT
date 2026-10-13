@@ -39,7 +39,7 @@ backtest 选项:
   --base 100000                 每只股票底仓市值(元)
   --t-ratio 0.3                 T 仓占底仓比例
   --max-t 2                     每日最多做T次数
-  --target 0.8                  目标胜率
+  --target 0.95                 目标胜率(train 默认 0.95,backtest/sweep 默认 0.8)
   --model realt-model.txt       使用 train 产出的参数包(backtest / replay)
   --params best.properties      加载规则参数文件(sweep 产出),命令行参数优先
 
@@ -219,7 +219,7 @@ private fun train(o: Map<String, String>) {
     println("训练 ${symbols.size} 只股票 → ${out.absolutePath}")
     println("费率: ${describeCosts(cfg.costs)}")
     val data = MarketData(r, out, useBreadth = o["no-breadth"] == null, log = ::println)
-    val target = o["target"]?.toDouble() ?: 0.8
+    val target = o["target"]?.toDouble() ?: 0.95
     val res = Trainer(data, cfg, target, log = ::println).run(symbols, out)
     println()
     println(res.report.lineSequence().takeWhile { !it.startsWith("## 阈值") }.joinToString("\n"))

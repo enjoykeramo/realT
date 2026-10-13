@@ -73,6 +73,10 @@ data class DayContext(
     val atrPct: Double,
     val regime: MarketRegime,
     val stage: StageEstimate,
+    /** 涨跌停幅度(主板 10%,创业板/科创板 20%,北交所 30%) */
+    val limitPct: Double = 0.10,
+    /** 开盘前可知的日线特征,见 [realt.core.ml.DailyFeatures] */
+    val daily: Map<String, Double> = emptyMap(),
 )
 
 /**

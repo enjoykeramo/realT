@@ -25,8 +25,18 @@ class SyntheticMarket(private val seed: Long = 42) {
         val rnd = Random(seed)
         val dates = tradingDates(20240102, days)
         // 指数
-        val index = dailyWalk(rnd, dates, 3000.0, 0.011)
+        val index = ArrayList(dailyWalk(rnd, dates.dropLast(minuteDays), 3000.0, 0.011))
+        val indexMinutes = ArrayList<Bar>()
+        var ip = index.last().close
+        for (d in dates.takeLast(minuteDays)) {
+            val day = intraday(rnd, d, ip, 0.011, DayType.entries[rnd.nextInt(DayType.entries.size)])
+            indexMinutes += day
+            index += Bar(d, -1, day.first().open, day.maxOf { it.high }, day.minOf { it.low }, day.last().close,
+                day.sumOf { it.volume }, day.sumOf { it.amount })
+            ip = day.last().close
+        }
         TdxWriter.writeDaily(File(vipdoc, "sh/lday/sh000001.day"), TdxReader.SH_INDEX, index)
+        TdxWriter.writeMinute(File(vipdoc, "sh/minline/sh000001.lc1"), indexMinutes)
 
         for (k in 0 until stocks) {
             val sym = if (k % 2 == 0) Symbol("sh", "60%04d".format(1000 + k)) else Symbol("sz", "00%04d".format(2000 + k))
