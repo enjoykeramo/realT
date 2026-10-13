@@ -1,0 +1,54 @@
+package realt.backtest
+
+import realt.core.learn.ContextMemory
+import realt.core.model.Symbol
+import java.io.File
+import java.util.Collections
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+
+data class RunResult(
+    val records: List<DayRecord>,
+    val gated: List<GatedTrade>,
+    val memory: ContextMemory,
+    val report: Report,
+)
+
+/** 多标的并行回测 → L6 时间顺序回放 → 输出报告 */
+class BacktestRunner(
+    private val data: MarketData,
+    private val cfg: BacktestConfig,
+    private val targetWinRate: Double = 0.8,
+    private val threads: Int = Runtime.getRuntime().availableProcessors().coerceIn(1, 8),
+    private val log: (String) -> Unit = {},
+) {
+    fun run(symbols: List<Symbol>, outDir: File?): RunResult {
+        val bt = Backtester(data, cfg)
+        val records = Collections.synchronizedList(ArrayList<DayRecord>())
+        val done = AtomicInteger()
+        val pool = Executors.newFixedThreadPool(threads)
+        for (s in symbols) pool.submit {
+            try {
+                records += bt.run(s)
+            } catch (e: Exception) {
+                log("  $s 回测失败: ${e.message}")
+            }
+            val k = done.incrementAndGet()
+            if (k % 10 == 0 || k == symbols.size) log("  进度 $k / ${symbols.size}")
+        }
+        pool.shutdown()
+        pool.awaitTermination(7, TimeUnit.DAYS)
+
+        val sorted = records.sortedWith(compareBy({ it.date }, { it.symbol.id }))
+        val (gated, memory) = MemoryReplay(cfg.costs, ContextMemory(targetWinRate = targetWinRate)).run(sorted)
+        val report = Report(sorted, gated, memory, cfg.costs, targetWinRate)
+        if (outDir != null) {
+            outDir.mkdirs()
+            File(outDir, "report.md").writeText(report.markdown())
+            File(outDir, "trades.csv").writeText("﻿" + report.tradesCsv())
+            File(outDir, "memory.csv").writeText("﻿" + memory.toCsv())
+        }
+        return RunResult(sorted, gated, memory, report)
+    }
+}

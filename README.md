@@ -1,0 +1,114 @@
+# realT —— A 股分时做T算法
+
+面向**已有底仓**的自选持仓,在分时图上给出高抛低吸(做T)建议,并用通达信离线数据做多标的回测验证。
+目标:**出手胜率 ≥ 80%,且扣除费用后期望为正**;看不清的日子宁可不做。
+
+算法设计与取舍见 [docs/DESIGN.md](docs/DESIGN.md)。
+
+## 模块
+
+| 模块 | 内容 | 依赖 |
+|---|---|---|
+| `core` | 纯算法:指标、缠论、大盘环境、主力阶段、分时形态预判、做T决策引擎、迷宫记忆 | 仅 Kotlin 标准库,JVM 17 字节码,**可直接给 stockAPP(Android)使用** |
+| `tdx` | 通达信 vipdoc 读取(`.day` / `.lc1` / `.lc5`)、市场宽度扫描 | core |
+| `backtest` | 分钟级回放、原型规则对照组、L6 记忆回放、参数扫描、报告 | core, tdx |
+| `app` | 命令行工具 `realt` | backtest |
+
+## Windows 上使用
+
+### 1. 准备数据(通达信)
+
+在通达信客户端「系统 → 盘后数据下载」中勾选并下载:
+
+- **日线和实时行情数据**(`vipdoc\sh|sz\lday`,用于大盘环境、主力阶段)
+- **1 分钟线数据**(`vipdoc\sh|sz\minline\*.lc1`,用于分时回测)
+
+1 分钟线下载的天数越多,回测越可信(建议至少半年)。
+
+### 2. 获取程序
+
+- 从 GitHub Releases 下载 `realt-<版本>-windows-x64.zip`(自带 Java,解压即用);或
+- 自行构建:`gradlew.bat :app:installDist`,程序在 `app\build\install\realt\bin\realt.bat`(需要 JDK 17+)
+
+### 3. 配置数据目录(只需一次)
+
+```bat
+realt.exe config --vipdoc D:\new_tdx\vipdoc
+realt.exe check
+```
+
+`check` 会列出日线 / 1 分钟线文件数量、数据日期范围。
+
+### 4. 回测
+
+```bat
+:: 指定几只持仓股
+realt.exe backtest --symbols sh601188,sz000001,600519 --out out1
+
+:: 从文件读股票列表(每行一个代码)
+realt.exe backtest --file 持仓.txt --out out2
+
+:: 随机抽 100 只有 1 分钟数据的 A 股做多目标验证
+realt.exe backtest --sample 100 --out out3
+```
+
+输出目录里:
+
+- `report.md`:总体对比(原型规则 / realT / realT+记忆)、前后半段稳定性、按真实分时形态拆分、形态预判准确率、按方向/平仓原因/信号/大盘/阶段拆分、**逐只股票达标情况**、记忆中的路口统计
+- `trades.csv`:每一笔做T明细(Excel 可直接打开)
+- `memory.csv`:L6 迷宫记忆(各上下文的胜率)
+- `breadth.csv`:全市场涨跌家数缓存
+
+### 5. 参数扫描(样本外检验)
+
+```bat
+realt.exe sweep --sample 100 --out sweep1
+realt.exe backtest --sample 100 --params sweep1\best.properties --out out4
+```
+
+`sweep` 在前 60% 的交易日上尝试 97 组参数,挑出达标且收益最好的,再在后 40%(从未参与挑选)上检验。
+**只认测试区间的结果**——训练区间好看而测试区间崩掉,就是过拟合。
+
+### 6. 单日回放(看算法每一步怎么想的)
+
+```bat
+realt.exe replay --symbol sh601188 --date 20250930
+```
+
+### 无数据体验
+
+```bat
+realt.exe demo
+```
+
+生成一个合成的 vipdoc 并跑完整流程。合成数据**没有任何实盘意义**,只用于确认程序可运行。
+
+## 在 stockAPP 中使用 core
+
+```kotlin
+// 开盘前
+val regime = MarketRegimeDetector().detect(indexDaily, breadth)      // L1
+val stage = StageDetector().detect(stockDaily)                       // L2
+val ctx = DayContext(prevClose, atrPct, regime, stage)
+val engine = TEngine(TConfig(), Costs(), ctx, baseShares = 2000, history = yesterday1m)
+
+// 盘中每来一根 1 分钟 K 线
+val advice: TAction? = engine.onBar(bar)          // 高抛 / 低吸 / 回补 / 卖出
+advice?.let { push(it.kind.label, it.price, it.shares, it.reason) }
+engine.dist                                        // 当前分时形态概率,可画在分时图上
+// 用户确认成交后
+engine.onFill(advice, fillPrice, minute)
+```
+
+## 构建与测试
+
+```bash
+./gradlew test               # 单元测试 + 端到端测试
+./gradlew :app:installDist   # 构建命令行工具
+```
+
+推送 `v*` 标签(例如 `v0.1.0`)会触发 GitHub Actions 构建 Windows 免安装版并发布 Release。
+
+## 免责声明
+
+本项目用于算法研究与验证,不构成投资建议。历史回测不代表未来收益。

@@ -1,0 +1,65 @@
+name: Release
+
+# 推送 v* 标签(如 v0.1.0)即构建并发布 Windows 版本
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || v="0.0.0-dev"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: ./gradlew test :app:installDist :app:distZip "-PrealtVersion=${{ steps.ver.outputs.version }}" --no-daemon
+
+      # 自带 Java 运行时的免安装版:解压即用,不需要另装 JDK
+      - name: Package (jpackage app-image)
+        shell: bash
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          jpackage --type app-image --name realt \
+            --input app/build/install/realt/lib \
+            --main-jar "app-$v.jar" --main-class realt.app.MainKt \
+            --java-options "-Xmx2g" --java-options "-Dfile.encoding=UTF-8" --add-modules java.base \
+            --win-console --dest build/pkg
+          cp README.md build/pkg/realt/
+          cd build/pkg && 7z a "../../realt-$v-windows-x64.zip" realt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: realt-windows
+          path: |
+            realt-*-windows-x64.zip
+            app/build/distributions/*.zip
+
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            realt-*-windows-x64.zip
+            app/build/distributions/*.zip
+          body: |
+            - `realt-<版本>-windows-x64.zip`:Windows 免安装版(自带 Java),解压后在命令行运行 `realt\realt.exe`
+            - `realt-<版本>.zip`:跨平台版,需要已安装 Java 17+
+            使用说明见 README。
