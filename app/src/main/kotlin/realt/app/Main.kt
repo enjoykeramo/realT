@@ -5,6 +5,7 @@ import realt.backtest.BacktestRunner
 import realt.backtest.Backtester
 import realt.backtest.MarketData
 import realt.backtest.ParameterSweep
+import realt.backtest.Progress
 import realt.backtest.TConfigIO
 import realt.backtest.Trainer
 import realt.core.engine.Costs
@@ -44,11 +45,12 @@ backtest 选项:
   --params best.properties      加载规则参数文件(sweep 产出),命令行参数优先
 
 费率选项(可在 config 中保存,也可在命令中临时指定):
-  --commission 0.00025          佣金率,双向(默认 万2.5)
+  --commission 0.0001           佣金率,双向(默认 万1)
   --min-commission 5            单笔最低佣金(元);免五填 0
   --stamp 0.0005                印花税率,仅卖出(2023-08-28 起为 万5)
   --transfer 0.00001            过户费率,双向(十万分之一)
   --slippage 0.0002             滑点,单边(默认 万2)
+  --threads 8                   并行线程数(默认 = CPU 核数)
   --no-breadth                  不扫描全市场宽度(更快)
   --out realt-out               输出目录
   --vipdoc <目录>               临时指定数据目录(不保存)
@@ -210,6 +212,9 @@ private fun backtestConfig(o: Map<String, String>): BacktestConfig {
     )
 }
 
+private fun threads(o: Map<String, String>) =
+    o["threads"]?.toInt()?.coerceAtLeast(1) ?: Runtime.getRuntime().availableProcessors()
+
 private fun train(o: Map<String, String>) {
     val r = reader(o)
     val symbols = symbolsFrom(o, r)
@@ -220,9 +225,9 @@ private fun train(o: Map<String, String>) {
     println("费率: ${describeCosts(cfg.costs)}")
     val data = MarketData(r, out, useBreadth = o["no-breadth"] == null, log = ::println)
     val target = o["target"]?.toDouble() ?: 0.95
-    val res = Trainer(data, cfg, target, log = ::println).run(symbols, out)
+    val res = Trainer(data, cfg, target, threads = threads(o)).run(symbols, out)
     println()
-    println(res.report.lineSequence().takeWhile { !it.startsWith("## 阈值") }.joinToString("\n"))
+    println(res.report.lineSequence().takeWhile { !it.startsWith("## 1.") }.joinToString("\n"))
     println("参数包: ${File(out, "realt-model.txt").absolutePath}")
     println("训练报告: ${File(out, "train-report.md").absolutePath}")
 }
@@ -250,7 +255,7 @@ private fun backtest(o: Map<String, String>) {
     cfg.model?.let { println("参数包: 阈值 ${it.threshold},训练数据截止 ${it.trainEnd}(之后的日期为样本外)") }
     val data = MarketData(r, out, useBreadth = o["no-breadth"] == null, log = ::println)
     val target = o["target"]?.toDouble() ?: 0.8
-    val res = BacktestRunner(data, cfg, target, log = ::println).run(symbols, out)
+    val res = BacktestRunner(data, cfg, target, threads(o), Progress()).run(symbols, out)
     println()
     println(res.report.markdown().lineSequence().takeWhile { !it.startsWith("## 2") && !it.startsWith("## 3") }.joinToString("\n"))
     println("完整报告: ${File(out, "report.md").absolutePath}")

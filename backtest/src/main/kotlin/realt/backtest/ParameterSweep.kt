@@ -51,17 +51,19 @@ class ParameterSweep(
         val records = Collections.synchronizedList(ArrayList<DayRecord>())
         val done = AtomicInteger()
         val pool = Executors.newFixedThreadPool(threads)
+        val progress = Progress()
+        progress.start("参数扫描", symbols.size)
         for (s in symbols) pool.submit {
             try {
                 records += bt.run(s)
             } catch (e: Exception) {
                 log("  $s 失败: ${e.message}")
             }
-            val k = done.incrementAndGet()
-            if (k % 10 == 0 || k == symbols.size) log("  进度 $k / ${symbols.size}")
+            progress.step(done.incrementAndGet(), s.id)
         }
         pool.shutdown()
         pool.awaitTermination(7, TimeUnit.DAYS)
+        progress.finish()
 
         val dates = records.map { it.date }.distinct().sorted()
         require(dates.size >= 10) { "交易日太少(${dates.size}),无法切分训练/测试区间" }

@@ -13,6 +13,7 @@ import realt.core.engine.TAction
 import realt.core.engine.TConfig
 import realt.core.engine.TEngine
 import realt.core.engine.Observer
+import realt.core.engine.SimBroker
 import realt.core.ml.TradeModel
 import realt.core.ml.DailyFeatures
 import realt.core.engine.TTrade
@@ -133,25 +134,21 @@ class Backtester(
             val predictor = DayTypePredictor()
             val observer = su.observer(predictor)
             val engines = variants.map { TEngine(it, cfg.costs, ctx, shares, null, model = cfg.model) }
-            val pendings = arrayOfNulls<TAction>(engines.size)
+            val brokers = engines.map { SimBroker(it, cfg.costs.slippage) }
+            val baseline = BaselineEngine(prevClose, shares, cfg.tConfig.tRatio, cfg.costs)
+            val baseBroker = SimBroker(baseline, cfg.costs.slippage)
             val preds = HashMap<Int, DayDist>()
             for (bar in dayBars) {
                 val obs = observer.observe(bar)
-                for ((k, e) in engines.withIndex()) {
-                    pendings[k]?.let { fill(e, it, bar.open, bar.minute) }
-                    pendings[k] = e.decide(bar, obs)
-                }
+                for ((k, e) in engines.withIndex()) brokers[k].onBar(bar) { e.decide(bar, obs) }
+                baseBroker.onBar(bar) { baseline.onBar(bar) }
                 val el = Session.elapsed(bar.minute)
                 if (el == 30 || el == 60 || el == 120) preds[el] = obs.dist
             }
             val lastBar = dayBars.last()
-            for ((k, e) in engines.withIndex()) {
-                pendings[k]?.let { fill(e, it, lastBar.close, lastBar.minute) }
-                e.forceClose(lastBar)?.let { fill(e, it, lastBar.close, lastBar.minute) }
-            }
+            brokers.forEach { it.endOfDay(lastBar) }
+            baseBroker.endOfDay(lastBar)
             val engine = engines[0]
-            val baseline = BaselineEngine(prevClose, shares, cfg.tConfig.tRatio, cfg.costs)
-            replay(baseline, dayBars) {}
 
             val prior = predictor.prior(ctx, dayBars.first().open)
             out += DayRecord(
@@ -164,24 +161,5 @@ class Backtester(
             )
         }
         return out
-    }
-
-    /** 下一根开盘成交;最后一根的建议按收盘价成交 */
-    private fun replay(s: IntradayStrategy, dayBars: List<Bar>, onBar: (Bar) -> Unit) {
-        var pending: TAction? = null
-        for (bar in dayBars) {
-            pending?.let { fill(s, it, bar.open, bar.minute) }
-            pending = s.onBar(bar)
-            onBar(bar)
-        }
-        val last = dayBars.last()
-        pending?.let { fill(s, it, last.close, last.minute) }
-        s.forceClose(last)?.let { fill(s, it, last.close, last.minute) }
-    }
-
-    private fun fill(s: IntradayStrategy, a: TAction, px: Double, minute: Int) {
-        val slip = cfg.costs.slippage
-        val buy = a.kind == ActionKind.OPEN_BUY || a.kind == ActionKind.CLOSE_BUY
-        s.onFill(a, if (buy) px * (1 + slip) else px * (1 - slip), minute)
     }
 }

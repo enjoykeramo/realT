@@ -43,6 +43,12 @@ data class TAction(
     val shares: Int,
     val reason: String,
     val closeReason: CloseReason? = null,
+    /** 限价;null 为市价(下一根开盘成交) */
+    val limitPrice: Double? = null,
+    /** 已在本根 K 线内以限价成交(止盈挂单被触及) */
+    val fillNow: Boolean = false,
+    /** 限价开仓单的有效期(开盘后经过的分钟数,含);-1 表示不限 */
+    val validUntil: Int = -1,
 )
 
 /**
@@ -93,6 +99,12 @@ data class TConfig(
     val regimeExit: Boolean = false,
     /** 平仓后冷却分钟数 */
     val cooldownMin: Int = 10,
+    /** 挂单开仓:先卖时挂在现价上方、先买时挂在现价下方的距离(日 ATR 倍数);0 = 市价 */
+    val entryOffsetAtr: Double = 0.0,
+    /** 挂单开仓的有效分钟数 */
+    val entryWaitMin: Int = 5,
+    /** 止盈以限价单挂出:K 线触及即按止盈价成交(否则按收盘判断、下一根开盘成交) */
+    val tpLimit: Boolean = true,
     val allowSellFirst: Boolean = true,
     val allowBuyFirst: Boolean = true,
 )
@@ -174,6 +186,9 @@ class Observer(
     /** 指数昨收 */
     private val indexPrevClose: Double = 0.0,
 ) {
+    init {
+        for (b in history) signals.warm(b)
+    }
     private var idxPtr = 0
     private var idxPv = 0.0
     private var idxV = 0.0
@@ -196,7 +211,7 @@ class Observer(
         val today = bars.subList(todayStart, bars.size)
         if (prior == null) prior = predictor.prior(ctx, today.first().open)
         val dist = predictor.posterior(prior!!, ctx, today)
-        val sig = signals.evaluate(bars, atrAbs)
+        val sig = signals.update(bar, atrAbs)
 
         val i = today.size - 1
         if (bar.high > hi) { hi = bar.high; hiIdx = i }
@@ -283,7 +298,9 @@ class TEngine(
 
     private val tShares = (baseShares * config.tRatio / 100).toInt() * 100
     private val atrAbs = max(ctx.atrPct, 0.005) * ctx.prevClose
-    private val minEdge = max(config.minEdgePct, config.edgeCostMultiple * costs.roundTripRate)
+    /** 本笔T仓规模下的实际来回成本比例(含最低 5 元佣金) */
+    private val costRate = costs.roundTripRateAt(tShares * ctx.prevClose)
+    private val minEdge = max(config.minEdgePct, config.edgeCostMultiple * costRate)
 
     private var pending: TAction? = null
     private var openDir: TDirection? = null
@@ -292,6 +309,7 @@ class TEngine(
     private var openKey: ContextKey? = null
     private var openNote = ""
     private var maxGain = 0.0
+    private var openByLimit = false
     private var lastCloseElapsed = -1000
     override val trades = ArrayList<TTrade>()
     override val log = ArrayList<String>()
@@ -399,9 +417,17 @@ class TEngine(
 
     private fun open(dir: TDirection, bar: Bar, note: String): TAction {
         val fam = if (dir == TDirection.SELL_FIRST) lastSignal?.sellFamily else lastSignal?.buyFamily
+        val sell = dir == TDirection.SELL_FIRST
+        val limit = if (config.entryOffsetAtr > 0) {
+            val off = config.entryOffsetAtr * atrAbs
+            if (sell) Fills.ceilTick(bar.close + off) else Fills.floorTick(bar.close - off)
+        } else null
         val action = TAction(
-            if (dir == TDirection.SELL_FIRST) ActionKind.OPEN_SELL else ActionKind.OPEN_BUY,
-            bar.date, bar.minute, bar.close, tShares, note,
+            if (sell) ActionKind.OPEN_SELL else ActionKind.OPEN_BUY,
+            bar.date, bar.minute, limit ?: bar.close, tShares,
+            if (limit != null) "$note | 挂单 %.2f".format(limit) else note,
+            limitPrice = limit,
+            validUntil = if (limit != null) Session.elapsed(bar.minute) + config.entryWaitMin else -1,
         )
         pending = action
         openKey = ContextKey(ctx.regime.level.name, ctx.stage.top.name, dist.top(), dir, fam ?: SignalFamily.NONE)
@@ -423,17 +449,34 @@ class TEngine(
         val held = Session.elapsed(bar.minute) - Session.elapsed(openMinute)
         val oppTrend = if (sell) upish() else downish()
 
+        // 止盈挂单:本根 K 线触及止盈价即按止盈价成交(挂单开仓成交的那一根不判断,避免同一根内先后顺序不明)
+        if (config.tpLimit && remaining > config.forceCloseBeforeCloseMin && adverse < config.stopLossAtr * atrAbs &&
+            !(openByLimit && bar.minute == openMinute)
+        ) {
+            val tp = if (sell) Fills.floorTick(openPrice - config.takeProfitAtr * atrAbs)
+            else Fills.ceilTick(openPrice + config.takeProfitAtr * atrAbs)
+            val touched = if (sell) bar.low <= tp - Fills.TICK else bar.high >= tp + Fills.TICK
+            if (touched) {
+                val a = TAction(
+                    if (sell) ActionKind.CLOSE_BUY else ActionKind.CLOSE_SELL,
+                    bar.date, bar.minute, tp, tShares, "止盈挂单成交 %.2f".format(tp), CloseReason.TARGET,
+                    limitPrice = tp, fillNow = true,
+                )
+                pending = a
+                return a
+            }
+        }
         val reason: CloseReason? = when {
             remaining <= config.forceCloseBeforeCloseMin -> CloseReason.TIME
             adverse >= config.stopLossAtr * atrAbs -> CloseReason.STOP
-            gain * openPrice >= config.takeProfitAtr * atrAbs -> CloseReason.TARGET
+            !config.tpLimit && gain * openPrice >= config.takeProfitAtr * atrAbs -> CloseReason.TARGET
             // 均值回归目标:价格回到均价线且已覆盖成本
             gain >= minEdge && (if (sell) px <= sig.vwap else px >= sig.vwap) -> CloseReason.VWAP
             gain >= minEdge && (if (sell) sig.buyScore else sig.sellScore) >= config.exitThreshold -> CloseReason.SIGNAL
             // 保本:曾经浮盈超过 2 倍 minEdge,回吐到只剩 minEdge/2 时离场,不让盈利单变亏损单
             maxGain >= 2 * minEdge && gain <= minEdge * 0.5 -> CloseReason.BREAKEVEN
             // 当日T必须当日完成:临近收盘,只要已覆盖成本就落袋,避免被迫按尾盘价收尾
-            remaining <= config.lateLockMin && gain >= costs.roundTripRate * 1.2 -> CloseReason.LATE_LOCK
+            remaining <= config.lateLockMin && gain >= costRate * 1.2 -> CloseReason.LATE_LOCK
             // 时间止损:持有过久且已亏损,盘面明显偏向不利的单边
             config.regimeExit && held >= config.maxHoldMin && gain < -minEdge * 0.5 && oppTrend > 0.6 -> CloseReason.REGIME_FLIP
             // 形态被确认为与持仓相反的单边:立即认错
@@ -461,6 +504,7 @@ class TEngine(
                 openDir = if (action.kind == ActionKind.OPEN_SELL) TDirection.SELL_FIRST else TDirection.BUY_FIRST
                 openPrice = price
                 openMinute = minute
+                openByLimit = action.limitPrice != null
                 maxGain = 0.0
                 log += "${hhmm(minute)} ${action.kind.label} ${action.shares}股 @%.2f  %s".format(price, action.reason)
             }
@@ -485,6 +529,10 @@ class TEngine(
         )
         pending = a
         return a
+    }
+
+    override fun onCancel(action: TAction) {
+        if (pending == action) pending = null
     }
 
     /** 建议未成交(例如实时场景用户放弃),撤销 */

@@ -12,4 +12,6 @@ interface IntradayStrategy {
     fun onFill(action: TAction, price: Double, minute: Int)
     /** 数据提前结束(停牌、缺数据)时强制收尾,恢复底仓;无持仓返回 null */
     fun forceClose(bar: Bar): TAction?
+    /** 挂单到期未成交被撤销 */
+    fun onCancel(action: TAction) {}
 }

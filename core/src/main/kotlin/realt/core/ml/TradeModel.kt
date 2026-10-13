@@ -19,14 +19,18 @@ class TradeModel(
     val trainEnd: Int,
     /** 训练报告摘要,原样保存 */
     val meta: Map<String, String> = emptyMap(),
+    /** 概率校准:模型原始分数 → 历史真实胜率 */
+    val calibration: Calibration = Calibration.IDENTITY,
 ) {
-    fun winProb(features: DoubleArray): Double = gbdt.predict(features)
+    /** 校准后的胜率概率 */
+    fun winProb(features: DoubleArray): Double = calibration.apply(gbdt.predict(features))
 
     fun serialize(): String = buildString {
         appendLine("# realT 参数包(训练产出,请勿手工修改模型段)")
         appendLine("format=1")
         appendLine("features=${Features.names.joinToString(",")}")
         appendLine("threshold=$threshold")
+        appendLine("calibration=${calibration.serialize()}")
         appendLine("trainStart=$trainStart")
         appendLine("trainEnd=$trainEnd")
         for ((k, v) in configMap(config)) appendLine("config.$k=$v")
@@ -67,6 +71,7 @@ class TradeModel(
                 cfg, costs, kv.getValue("threshold").toDouble(), Gbdt.deserialize(body),
                 kv["trainStart"]?.toInt() ?: 0, kv["trainEnd"]?.toInt() ?: 0,
                 kv.filterKeys { it.startsWith("meta.") }.mapKeys { it.key.removePrefix("meta.") },
+                Calibration.parse(kv["calibration"] ?: ""),
             )
         }
 
@@ -91,6 +96,9 @@ class TradeModel(
             "cooldownMin" to c.cooldownMin.toString(),
             "allowSellFirst" to c.allowSellFirst.toString(),
             "allowBuyFirst" to c.allowBuyFirst.toString(),
+            "entryOffsetAtr" to c.entryOffsetAtr.toString(),
+            "entryWaitMin" to c.entryWaitMin.toString(),
+            "tpLimit" to c.tpLimit.toString(),
         )
 
         fun configFrom(m: Map<String, String>, base: TConfig = TConfig()): TConfig {
@@ -118,6 +126,9 @@ class TradeModel(
                 cooldownMin = i("cooldownMin", base.cooldownMin),
                 allowSellFirst = b("allowSellFirst", base.allowSellFirst),
                 allowBuyFirst = b("allowBuyFirst", base.allowBuyFirst),
+                entryOffsetAtr = d("entryOffsetAtr", base.entryOffsetAtr),
+                entryWaitMin = i("entryWaitMin", base.entryWaitMin),
+                tpLimit = b("tpLimit", base.tpLimit),
             )
         }
     }

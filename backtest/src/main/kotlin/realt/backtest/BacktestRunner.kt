@@ -20,25 +20,26 @@ class BacktestRunner(
     private val data: MarketData,
     private val cfg: BacktestConfig,
     private val targetWinRate: Double = 0.8,
-    private val threads: Int = Runtime.getRuntime().availableProcessors().coerceIn(1, 8),
-    private val log: (String) -> Unit = {},
+    private val threads: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
+    private val progress: Progress? = null,
 ) {
     fun run(symbols: List<Symbol>, outDir: File?): RunResult {
         val bt = Backtester(data, cfg)
         val records = Collections.synchronizedList(ArrayList<DayRecord>())
         val done = AtomicInteger()
         val pool = Executors.newFixedThreadPool(threads)
+        progress?.start("回测", symbols.size)
         for (s in symbols) pool.submit {
             try {
                 records += bt.run(s)
             } catch (e: Exception) {
-                log("  $s 回测失败: ${e.message}")
+                progress?.log("  $s 回测失败: ${e.message}")
             }
-            val k = done.incrementAndGet()
-            if (k % 10 == 0 || k == symbols.size) log("  进度 $k / ${symbols.size}")
+            progress?.step(done.incrementAndGet(), s.id)
         }
         pool.shutdown()
         pool.awaitTermination(7, TimeUnit.DAYS)
+        progress?.finish()
 
         val sorted = records.sortedWith(compareBy({ it.date }, { it.symbol.id }))
         val (gated, memory) = if (cfg.model != null) {

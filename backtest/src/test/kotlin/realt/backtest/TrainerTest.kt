@@ -32,6 +32,12 @@ class TrainerTest {
         for (r in bt.records) for (t in r.trades) assertTrue(t.date == r.date && t.closeMinute >= t.openMinute)
         assertTrue(bt.report.markdown().contains("样本外"))
         assertTrue(res.model.gbdt.trees.isNotEmpty())
+
+        // 训练器在测试段的模拟结果,应与真实引擎逐分钟回放(参数包)的样本外结果一致
+        val testStart = pack.meta.getValue("testStart").toInt()
+        val oos = bt.records.filter { it.date >= testStart }.flatMap { it.trades }
+        val expected = pack.meta.getValue("testTrades").toInt()
+        assertTrue(kotlin.math.abs(oos.size - expected) <= maxOf(2, expected / 10), "engine=${oos.size} trainer=$expected")
     }
 }
 

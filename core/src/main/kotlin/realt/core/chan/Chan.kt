@@ -90,13 +90,86 @@ class ChanAnalyzer(
     private val divergenceRatio: Double = 0.85,
 ) {
 
-    fun analyze(bars: List<Bar>): ChanResult {
+    /** [hist] 为与 [bars] 对齐的 MACD 柱;不传则内部计算 */
+    fun analyze(bars: List<Bar>, hist: DoubleArray? = null): ChanResult {
         val merged = merge(bars)
         val pivots = strokesPivots(merged)
         val strokes = pivots.zipWithNext { a, b -> Stroke(a, b) }
         val centers = centers(strokes)
-        val fresh = freshPoint(bars, merged, pivots, strokes, centers)
+        val h = hist ?: Indicators.macd(bars.closes()).hist
+        val fresh = freshPoint(h, merged, pivots, strokes, centers)
         return ChanResult(merged, pivots, strokes, centers, fresh)
+    }
+
+    /**
+     * 连续型结构特征(供模型使用),只用已确认分型与当前价格:
+     *  - upRatio / dnRatio:最近一段上涨(下跌)的 MACD 红(绿)柱面积 ÷ 前一段同向笔面积,< 1 表示背驰
+     *  - upNew / dnNew:最近一段上涨是否创出比前一同向笔更高的高点(下跌是否更低)
+     *  - legAmp:自最后一个分型以来的位移(ATR,带符号)
+     *  - barsSince:距最后一个分型的 K 线数
+     *  - lastTop:最后一个分型是否为顶
+     *  - centerPos:价格在最后一个中枢 [ZD, ZG] 中的位置(0=ZD,1=ZG,可超出);hasCenter
+     */
+    class Legs(
+        val upRatio: Double, val upNew: Double, val dnRatio: Double, val dnNew: Double,
+        val legAmp: Double, val barsSince: Double, val lastTop: Double,
+        val centerPos: Double, val hasCenter: Double,
+    ) {
+        companion object { val EMPTY = Legs(1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0) }
+    }
+
+    fun legs(r: ChanResult, bars: List<Bar>, hist: DoubleArray, atrAbs: Double): Legs {
+        val pv = r.pivots
+        if (pv.size < 2 || bars.isEmpty()) return Legs.EMPTY
+        val n = bars.size - 1
+        val price = bars[n].close
+        val last = pv.last()
+        fun areaRange(from: Int, to: Int, up: Boolean): Double {
+            var a = 0.0
+            for (i in maxOf(0, from)..minOf(to, hist.size - 1)) {
+                val v = hist[i]
+                if (up && v > 0) a += v
+                if (!up && v < 0) a -= v
+            }
+            return a
+        }
+        var hiSince = Double.NEGATIVE_INFINITY; var loSince = Double.POSITIVE_INFINITY
+        for (i in last.idx..n) { hiSince = maxOf(hiSince, bars[i].high); loSince = minOf(loSince, bars[i].low) }
+
+        // 上涨段:若最后是底分型,当前进行中的上涨 vs 上一根上涨笔;若最后是顶,最近完成的上涨笔 vs 再前一根
+        fun ratio(up: Boolean): Pair<Double, Double> {
+            val lastIsStart = (last.type == FractalType.BOTTOM) == up // 最后一个分型是该方向段的起点
+            return if (lastIsStart) {
+                val cur = areaRange(last.idx, n, up)
+                val curExt = if (up) hiSince else loSince
+                if (pv.size >= 3) {
+                    val pe = pv[pv.size - 2]; val ps = pv[pv.size - 3]
+                    val prev = areaRange(ps.idx, pe.idx, up)
+                    val newExt = if (up) curExt > pe.price else curExt < pe.price
+                    (if (prev > 1e-12) cur / prev else 1.0) to (if (newExt) 1.0 else 0.0)
+                } else 1.0 to 0.0
+            } else {
+                if (pv.size >= 4) {
+                    val ce = pv[pv.size - 1]; val cs = pv[pv.size - 2]
+                    val pe = pv[pv.size - 3]; val ps = pv[pv.size - 4]
+                    val cur = areaRange(cs.idx, ce.idx, up)
+                    val prev = areaRange(ps.idx, pe.idx, up)
+                    val newExt = if (up) ce.price > pe.price else ce.price < pe.price
+                    (if (prev > 1e-12) cur / prev else 1.0) to (if (newExt) 1.0 else 0.0)
+                } else 1.0 to 0.0
+            }
+        }
+        val (ur, un) = ratio(true)
+        val (dr, dn) = ratio(false)
+        val c = r.lastCenter
+        val cpos = if (c != null && c.zg > c.zd) ((price - c.zd) / (c.zg - c.zd)).coerceIn(-4.0, 5.0) else 0.0
+        return Legs(
+            ur.coerceAtMost(3.0), un, dr.coerceAtMost(3.0), dn,
+            ((price - last.price) / atrAbs).coerceIn(-3.0, 3.0),
+            (n - last.idx).toDouble().coerceAtMost(120.0),
+            if (last.type == FractalType.TOP) 1.0 else 0.0,
+            cpos, if (c != null) 1.0 else 0.0,
+        )
     }
 
     // ---------- 1. 包含处理 ----------
@@ -188,7 +261,7 @@ class ChanAnalyzer(
 
     // ---------- 5/6. 背驰与买卖点 ----------
     private fun freshPoint(
-        bars: List<Bar>,
+        hist: DoubleArray,
         m: List<MergedBar>,
         pivots: List<Pivot>,
         strokes: List<Stroke>,
@@ -198,7 +271,6 @@ class ChanAnalyzer(
         val last = pivots.last()
         // 仅当分型由最新一根合并K线确认时才视为"刚出现"的信号
         if (last.mIdx != m.size - 2) return null
-        val hist = Indicators.macd(bars.closes()).hist
         val bottom = last.type == FractalType.BOTTOM
 
         // 当前这一笔(以 last 结束)与上一根同向笔
