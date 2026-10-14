@@ -21,6 +21,8 @@ class TradeModel(
     val meta: Map<String, String> = emptyMap(),
     /** 概率校准:模型原始分数 → 历史真实胜率 */
     val calibration: Calibration = Calibration.IDENTITY,
+    /** 迭代寻优得到的策略;为 null 时只按模型胜率 ≥ [threshold] 出手 */
+    val strategy: StrategySpec? = null,
 ) {
     /** 校准后的胜率概率 */
     fun winProb(features: DoubleArray): Double = calibration.apply(gbdt.predict(features))
@@ -31,6 +33,7 @@ class TradeModel(
         appendLine("features=${Features.names.joinToString(",")}")
         appendLine("threshold=$threshold")
         appendLine("calibration=${calibration.serialize()}")
+        strategy?.let { appendLine("strategy=${it.serialize()}") }
         appendLine("trainStart=$trainStart")
         appendLine("trainEnd=$trainEnd")
         for ((k, v) in configMap(config)) appendLine("config.$k=$v")
@@ -72,6 +75,7 @@ class TradeModel(
                 kv["trainStart"]?.toInt() ?: 0, kv["trainEnd"]?.toInt() ?: 0,
                 kv.filterKeys { it.startsWith("meta.") }.mapKeys { it.key.removePrefix("meta.") },
                 Calibration.parse(kv["calibration"] ?: ""),
+                kv["strategy"]?.let { StrategySpec.parse(it) },
             )
         }
 

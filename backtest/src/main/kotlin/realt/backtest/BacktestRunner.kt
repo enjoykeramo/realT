@@ -33,7 +33,8 @@ class BacktestRunner(
             try {
                 records += bt.run(s)
             } catch (e: Exception) {
-                progress?.log("  $s 回测失败: ${e.message}")
+                val msg = "  $s 回测失败: $e"
+                if (progress != null) progress.log(msg) else System.err.println(msg)
             }
             progress?.step(done.incrementAndGet(), s.id)
         }

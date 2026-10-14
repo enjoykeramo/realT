@@ -13,6 +13,7 @@ import realt.core.signal.SignalEngine
 import realt.core.signal.SignalFamily
 import realt.core.ml.Features
 import realt.core.ml.TradeModel
+import realt.core.ml.StrategySpec
 import realt.core.signal.SignalSnapshot
 import kotlin.math.max
 
@@ -392,19 +393,26 @@ class TEngine(
 
     /** 模型模式:对每个候选方向计算胜率概率,取最高且 ≥ 阈值者 */
     private fun decideByModel(bar: Bar, obs: Observation, m: TradeModel): TAction? {
+        val st = m.strategy
         var best: TDirection? = null
-        var bestP = -1.0
+        var bestP = Double.NEGATIVE_INFINITY
+        var bestWin = Double.NaN
         for (d in Features.candidates(obs)) {
             if (d == TDirection.SELL_FIRST && !config.allowSellFirst) continue
             if (d == TDirection.BUY_FIRST && !config.allowBuyFirst) continue
-            val p = m.winProb(Features.extract(ctx, obs, d))
-            if (p > bestP) { bestP = p; best = d }
+            if (st != null && !StrategySpec.allows(st, ctx, obs, d)) continue
+            val useModel = st == null || st.useModel
+            val win = if (useModel) m.winProb(Features.extract(ctx, obs, d)) else Double.NaN
+            if (useModel && win < (st?.modelThr ?: m.threshold)) continue
+            // 优先级:用模型时取胜率高者,否则取 L4 综合分高者(与训练时一致)
+            val pr = if (useModel) win else StrategySpec.score(obs, d)
+            if (pr > bestP) { bestP = pr; best = d; bestWin = win }
         }
         val choice = best ?: return null
-        if (bestP < m.threshold) return null
         val sig = obs.sig
-        val note = "%s 模型胜率%.0f%% | %s | 形态:%s".format(
-            choice.label, bestP * 100, sig.note.ifEmpty { "均价偏离%.2fATR".format(sig.vwapDev) }, dist.describe())
+        val note = "%s %s| %s | 形态:%s".format(
+            choice.label, if (bestWin.isNaN()) "" else "模型胜率%.0f%% ".format(bestWin * 100),
+            sig.note.ifEmpty { "均价偏离%.2fATR".format(sig.vwapDev) }, dist.describe())
         return open(choice, bar, note)
     }
 
@@ -425,7 +433,7 @@ class TEngine(
         val action = TAction(
             if (sell) ActionKind.OPEN_SELL else ActionKind.OPEN_BUY,
             bar.date, bar.minute, limit ?: bar.close, tShares,
-            if (limit != null) "$note | 挂单 %.2f".format(limit) else note,
+            if (limit != null) note + " | 挂单 " + "%.2f".format(limit) else note,
             limitPrice = limit,
             validUntil = if (limit != null) Session.elapsed(bar.minute) + config.entryWaitMin else -1,
         )

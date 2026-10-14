@@ -58,3 +58,26 @@ class GbdtTest {
         assertEquals(0.83, TradeModel.parse(text.replace("\n", "\r\n")).threshold)
     }
 }
+
+class StrategySpecTest {
+    @Test
+    fun roundTripAndFilters() {
+        val s = realt.core.ml.StrategySpec(dirs = 1, families = 2 or 8, timeStart = 30, timeEnd = 120, regimeMask = 0b00110,
+            atrMin = 0.02, atrMax = 0.06, vwapDevMin = 0.1, withTrendMin = -0.2, useModel = true, modelThr = 0.9, maxTrades = 1)
+        assertEquals(s, realt.core.ml.StrategySpec.parse(s.serialize()))
+        val sell = realt.core.engine.TDirection.SELL_FIRST
+        val buy = realt.core.engine.TDirection.BUY_FIRST
+        assertTrue(s.allows(2, sell, 60, 1, 0.03, 0.2, 0.0))
+        assertTrue(!s.allows(2, buy, 60, 1, 0.03, 0.2, 0.0))      // 方向
+        assertTrue(!s.allows(1, sell, 60, 1, 0.03, 0.2, 0.0))     // 信号来源
+        assertTrue(!s.allows(3, sell, 60, 1, 0.03, 0.2, 0.0))     // RSI 未选
+        assertTrue(s.allows(4, sell, 60, 1, 0.03, 0.2, 0.0))      // 缠论5分钟已选
+        assertTrue(!s.allows(2, sell, 150, 1, 0.03, 0.2, 0.0))    // 时间窗
+        assertTrue(!s.allows(2, sell, 60, 0, 0.03, 0.2, 0.0))     // 大盘
+        assertTrue(!s.allows(2, sell, 60, 1, 0.01, 0.2, 0.0))     // ATR
+        assertTrue(!s.allows(2, sell, 60, 1, 0.03, 0.05, 0.0))    // 均价偏离
+        assertTrue(!s.allows(2, sell, 60, 1, 0.03, 0.2, -0.5))    // 顺势
+        assertEquals("09:35", realt.core.ml.StrategySpec.clock(5))
+        assertEquals("13:30", realt.core.ml.StrategySpec.clock(150))
+    }
+}

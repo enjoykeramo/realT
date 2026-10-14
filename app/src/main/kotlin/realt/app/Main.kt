@@ -26,7 +26,8 @@ realT —— A 股分时做T算法验证工具
   realt config --vipdoc <通达信vipdoc目录>      保存数据目录,例如 D:\new_tdx\vipdoc
   realt config --commission 0.0001 --min-commission 5   保存你券商的费率(见下方费率选项)
   realt check                                  检查数据目录、数据覆盖范围,显示当前费率
-  realt train [选项]                           训练:学习胜率模型并选参数,输出参数包 realt-model.txt 与 train-report.md
+  realt train [选项]                           训练(迭代寻优):策略回测→保留好的→二次验证→迭代,最后一次性验收;
+                                               输出参数包 realt-model.txt 与 train-report.md
   realt backtest [选项]                        多标的回测,输出 report.md / trades.csv;加 --model 使用参数包
   realt sweep [backtest 选项]                  规则参数扫描(不训练模型),输出 sweep.md / best.properties
   realt replay --symbol sh600000 --date 20250930  单只股票单日逐笔回放(看引擎每一步判断)
@@ -51,6 +52,13 @@ backtest 选项:
   --transfer 0.00001            过户费率,双向(十万分之一)
   --slippage 0.0002             滑点,单边(默认 万2)
   --threads 8                   并行线程数(默认 = CPU 核数)
+
+train 专用选项:
+  --rounds 60                   最多迭代轮数(已有策略通过验证、且连续 12 轮无改进时提前结束)
+  --population 400              每轮评估的策略数
+  --min-trades 30               寻优期每条策略至少成交笔数
+  --min-val-trades 30           二次验证期至少成交笔数(笔数太少的"达标"可能是运气)
+  --no-ablation                 跳过模块消融(更快)
   --no-breadth                  不扫描全市场宽度(更快)
   --out realt-out               输出目录
   --vipdoc <目录>               临时指定数据目录(不保存)
@@ -225,7 +233,15 @@ private fun train(o: Map<String, String>) {
     println("费率: ${describeCosts(cfg.costs)}")
     val data = MarketData(r, out, useBreadth = o["no-breadth"] == null, log = ::println)
     val target = o["target"]?.toDouble() ?: 0.95
-    val res = Trainer(data, cfg, target, threads = threads(o)).run(symbols, out)
+    val res = Trainer(
+        data, cfg, target,
+        rounds = o["rounds"]?.toInt() ?: 60,
+        population = o["population"]?.toInt() ?: 400,
+        minTrades = o["min-trades"]?.toInt() ?: 30,
+        minValTrades = o["min-val-trades"]?.toInt() ?: 30,
+        ablation = o["no-ablation"] == null,
+        threads = threads(o),
+    ).run(symbols, out)
     println()
     println(res.report.lineSequence().takeWhile { !it.startsWith("## 1.") }.joinToString("\n"))
     println("参数包: ${File(out, "realt-model.txt").absolutePath}")

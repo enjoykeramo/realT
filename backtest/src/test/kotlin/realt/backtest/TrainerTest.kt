@@ -11,19 +11,21 @@ class TrainerTest {
     @Test
     fun trainProducesLoadablePackAndOutOfSampleBacktestRuns() {
         val dir = Files.createTempDirectory("vipdoc").toFile()
-        SyntheticMarket(seed = 11).generate(dir, stocks = 4, days = 240, minuteDays = 30)
+        SyntheticMarket(seed = 11).generate(dir, stocks = 4, days = 240, minuteDays = 40)
         val reader = TdxReader(dir)
         val symbols = reader.listMinuteSymbols()
         val out = Files.createTempDirectory("model").toFile()
         val data = MarketData(reader, out, useBreadth = false)
 
-        val res = Trainer(data, BacktestConfig(), minTrades = 5).run(symbols, out)
+        val res = Trainer(data, BacktestConfig(), minTrades = 5, minValTrades = 3, rounds = 6, population = 80).run(symbols, out)
         val packFile = out.resolve("realt-model.txt")
         assertTrue(packFile.isFile)
-        assertTrue(out.resolve("train-report.md").readText().contains("测试段(样本外)"))
+        assertTrue(out.resolve("train-report.md").readText().contains("最终验收期"))
 
         val pack = TradeModel.parse(packFile.readText())
-        assertTrue(pack.threshold in 0.5..0.95)
+        assertTrue(pack.threshold in 0.0..0.95)
+        assertTrue(pack.strategy != null)
+        assertTrue(out.resolve("train-report.md").readText().contains("迭代过程"))
         assertTrue(pack.trainEnd >= pack.trainStart)
 
         // 用参数包回测:引擎走模型分支,且每笔都当日开平
