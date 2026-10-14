@@ -28,7 +28,22 @@
 ### 2. 获取程序
 
 - 从 GitHub Releases 下载 `realt-<版本>-windows-x64.zip`(自带 Java,解压即用);或
-- 自行构建:`gradlew.bat :app:installDist`,程序在 `app\build\install\realt\bin\realt.bat`(需要 JDK 17+)
+- **自行构建(推荐)**:在代码根目录的命令行窗口运行 `build.bat`(需要 JDK 17+,Gradle 8.x 在 PATH 中;
+  没有 Gradle 时自动使用 `gradlew.bat`)。生成的免安装版在 `dist\realt\realt.exe`。
+
+```bat
+cd /d D:\lk\code\realT
+git pull
+build.bat                  :: 输出到 dist\realt
+build.bat test             :: 先跑单元测试再构建
+build.bat D:\tools\realt   :: 输出到指定目录
+```
+
+`build.bat` 每次都会全新编译、全新打包,再复制到输出目录;输出目录里你自己的结果(如 `model1`、`out1`)会保留,
+只替换程序部分(`app`、`runtime`、`realt.exe`)。
+
+**确认运行的是新版本**:`realt.exe version` 会显示版本、构建时间和提交号,`train` / `backtest` 开始时也会先打印这一行。
+如果看不到这一行,说明运行的还是旧程序(例如以前手工打包的 `build\pkg\realt`)。
 
 ### 3. 配置数据目录与费率(只需一次)
 
@@ -146,9 +161,11 @@ engine.onFill(advice, fillPrice, minute)
 
 ## 内存
 
-- 程序默认使用本机物理内存的 75% 作为 Java 内存上限(`-XX:MaxRAMPercentage=75`),训练开始时会显示可用上限
-- 训练先抽样估算所需内存:1000 只股票、约 90 个交易日大约需要 3GB;若超出可用内存,会**随机保留部分「股票·交易日」**
-  (整日保留)并明确提示,不会中途崩溃
+- 程序默认使用本机物理内存的 75% 作为 Java 内存上限(`-XX:MaxRAMPercentage=75`),`realt.exe version` 与训练开始时都会显示
+- 候选生成时,每只股票算完立即写入输出目录下的临时文件 `candidates.tmp`(训练结束自动删除),内存里只保留各线程正在算的那一只;
+  全部算完后按**精确行数**一次性载入。1000 只股票、约 90 个交易日约需 2~3GB 内存,临时文件约 2GB 磁盘
+- 若数据超出可用内存,会**随机保留部分「股票·交易日」**(整日保留)并明确提示,报告里也会注明,不会中途崩溃
+- 胜率模型与消融训练的并发数按剩余内存自动限制;进度条后面会显示「内存 已用/上限」
 - 调整上限:免安装版编辑 `realt\app\realt.cfg` 中 `[JavaOptions]` 下的 `-XX:MaxRAMPercentage=75`(或改为 `-Xmx12g`);
   脚本版运行前 `set JAVA_OPTS=-Xmx12g`
 
@@ -159,15 +176,7 @@ engine.onFill(advice, fillPrice, minute)
 ./gradlew :app:installDist   # 构建命令行工具
 ```
 
-本地打包 Windows 免安装版(自带 Java 运行时,生成 `build\pkg\realt\realt.exe`):
-
-```bat
-gradle :app:installDist
-jpackage --type app-image --name realt --input app\build\install\realt\lib ^
-  --main-jar app-0.1.0.jar --main-class realt.app.MainKt ^
-  --java-options "-XX:MaxRAMPercentage=75" --java-options "-Dfile.encoding=UTF-8" ^
-  --add-modules java.base --win-console --dest build\pkg
-```
+本地打包 Windows 免安装版:运行代码根目录的 `build.bat`(见上文「获取程序」),生成 `dist\realt\realt.exe`。
 
 推送 `v*` 标签(例如 `v0.1.0`)会触发 GitHub Actions 构建 Windows 免安装版并发布 Release。
 

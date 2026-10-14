@@ -32,6 +32,7 @@ realT —— A 股分时做T算法验证工具
   realt sweep [backtest 选项]                  规则参数扫描(不训练模型),输出 sweep.md / best.properties
   realt replay --symbol sh600000 --date 20250930  单只股票单日逐笔回放(看引擎每一步判断)
   realt demo [--out demo-vipdoc]               生成合成数据并跑通全流程(无实盘意义)
+  realt version                                显示版本、构建时间与 Java 内存上限
 
 backtest 选项:
   --symbols sh600000,sz000001   指定股票(逗号分隔)
@@ -81,7 +82,11 @@ fun main(args: Array<String>) {
     if (args.isEmpty() || args[0] in listOf("-h", "--help", "help")) {
         println(HELP.trimIndent()); return
     }
+    if (args[0] in listOf("version", "-v", "--version")) {
+        println(buildInfo()); return
+    }
     val opts = parseOpts(args.drop(1))
+    if (args[0] in listOf("train", "backtest", "sweep", "demo")) println(buildInfo())
     try {
         when (args[0]) {
             "config" -> config(opts)
@@ -109,6 +114,17 @@ fun main(args: Array<String>) {
         System.err.println("     脚本版设置环境变量 set JAVA_OPTS=-Xmx12g 后再运行")
         exitProcess(3)
     }
+}
+
+/** 版本 + 构建时间 + 提交号 + 内存上限,例如:realT 0.1.0(构建 2026-10-14T10:20:30 a1b2c3d)· Java 21 · 内存上限 12.0GB */
+private fun buildInfo(): String {
+    val p = Properties()
+    object {}.javaClass.getResourceAsStream("/realt/build.properties")?.use { p.load(it) }
+    val commit = p.getProperty("commit", "").let { if (it.isEmpty()) "" else " $it" }
+    return "realT %s(构建 %s%s)· Java %s · 内存上限 %.1fGB · CPU %d 核".format(
+        p.getProperty("version", "dev"), p.getProperty("built", "?"), commit,
+        System.getProperty("java.version"), Runtime.getRuntime().maxMemory() / 1e9, Runtime.getRuntime().availableProcessors(),
+    )
 }
 
 private fun parseOpts(a: List<String>): Map<String, String> {

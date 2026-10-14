@@ -157,10 +157,10 @@ class Gbdt(val base: Double, val learningRate: Double, val trees: List<Tree>) {
             val prior = ((pos + 1) / (trainRows.size + 2)).coerceIn(1e-4, 1 - 1e-4)
             val base = ln(prior / (1 - prior))
             val n = d.nRows
-            val margin = DoubleArray(n)
-            for (r in trainRows) margin[r] = base
-            for (r in esRows) margin[r] = base
-            // 梯度用 float 存储:候选点上百万时,每个并行任务省一半内存
+            // 间隔/梯度均用 float 存储:候选点上百万时,每个并行任务的工作区约 12 字节/行
+            val margin = FloatArray(n)
+            for (r in trainRows) margin[r] = base.toFloat()
+            for (r in esRows) margin[r] = base.toFloat()
             val grad = FloatArray(n)
             val hess = FloatArray(n)
             val trees = ArrayList<Tree>()
@@ -171,7 +171,7 @@ class Gbdt(val base: Double, val learningRate: Double, val trees: List<Tree>) {
 
             for (t in 0 until p.nTrees) {
                 for (r in trainRows) {
-                    val pr = 1.0 / (1.0 + exp(-margin[r]))
+                    val pr = 1.0 / (1.0 + exp(-margin[r].toDouble()))
                     grad[r] = (pr - y[r]).toFloat()
                     hess[r] = maxOf(pr * (1 - pr), 1e-6).toFloat()
                 }
@@ -179,12 +179,12 @@ class Gbdt(val base: Double, val learningRate: Double, val trees: List<Tree>) {
                 val cols = feats.filter { rnd.nextDouble() < p.colSample }.ifEmpty { listOf(feats[rnd.nextInt(feats.size)]) }.toIntArray()
                 val tree = TreeBuilder(d, grad, hess, cols, p, importance).build(rows)
                 trees += tree
-                for (r in trainRows) margin[r] += p.learningRate * tree.predictBinned(d, r)
+                for (r in trainRows) margin[r] += (p.learningRate * tree.predictBinned(d, r)).toFloat()
                 if (esRows.isNotEmpty()) {
                     var loss = 0.0
                     for (r in esRows) {
-                        margin[r] += p.learningRate * tree.predictBinned(d, r)
-                        val pr = (1.0 / (1.0 + exp(-margin[r]))).coerceIn(1e-9, 1 - 1e-9)
+                        margin[r] += (p.learningRate * tree.predictBinned(d, r)).toFloat()
+                        val pr = (1.0 / (1.0 + exp(-margin[r].toDouble()))).coerceIn(1e-9, 1 - 1e-9)
                         loss -= if (y[r].toInt() == 1) ln(pr) else ln(1 - pr)
                     }
                     loss /= esRows.size

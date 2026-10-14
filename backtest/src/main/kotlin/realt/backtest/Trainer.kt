@@ -69,6 +69,137 @@ class Trainer(
         }
     }
 
+    /** 全局列存:各股票算完后追加进来(同一股票的行连续、按时间有序),块随即释放 */
+    private class Store(val nf: Int, val nk: Int, cap0: Int) {
+        var n = 0; private set
+        private var cap = cap0
+        var symbol = IntArray(cap); var date = IntArray(cap); var elapsed = ShortArray(cap); var dir = ByteArray(cap)
+        var family = ByteArray(cap); var regime = ByteArray(cap); var atr = FloatArray(cap); var vdev = FloatArray(cap)
+        var trend = FloatArray(cap); var score = FloatArray(cap)
+        var pnl = FloatArray(cap * nk); var reason = ByteArray(cap * nk); var closeE = ShortArray(cap * nk)
+        var cols = Array(nf) { ByteArray(cap) }
+
+        /** 追加一块;[keepRow] 不为空时只追加满足条件的行(按日再抽样) */
+        @Synchronized
+        fun append(b: Block, keepRow: ((Int) -> Boolean)? = null) {
+            if (keepRow != null) { appendRows(b, keepRow); return }
+            if (n + b.n > cap) grow(n + b.n)
+            val o = n
+            java.util.Arrays.fill(symbol, o, o + b.n, b.symbol)
+            System.arraycopy(b.date, 0, date, o, b.n); System.arraycopy(b.elapsed, 0, elapsed, o, b.n)
+            System.arraycopy(b.dir, 0, dir, o, b.n); System.arraycopy(b.family, 0, family, o, b.n)
+            System.arraycopy(b.regime, 0, regime, o, b.n); System.arraycopy(b.atr, 0, atr, o, b.n)
+            System.arraycopy(b.vdev, 0, vdev, o, b.n); System.arraycopy(b.trend, 0, trend, o, b.n)
+            System.arraycopy(b.score, 0, score, o, b.n)
+            System.arraycopy(b.pnl, 0, pnl, o * nk, b.n * nk); System.arraycopy(b.reason, 0, reason, o * nk, b.n * nk)
+            System.arraycopy(b.closeE, 0, closeE, o * nk, b.n * nk)
+            for (f in 0 until nf) { val col = cols[f]; for (i in 0 until b.n) col[o + i] = b.x[i * nf + f] }
+            n += b.n
+            b.release()
+        }
+
+        private fun appendRows(b: Block, keepRow: (Int) -> Boolean) {
+            var m = 0
+            for (i in 0 until b.n) if (keepRow(i)) m++
+            if (n + m > cap) grow(n + m)
+            for (i in 0 until b.n) {
+                if (!keepRow(i)) continue
+                val o = n
+                symbol[o] = b.symbol; date[o] = b.date[i]; elapsed[o] = b.elapsed[i]; dir[o] = b.dir[i]
+                family[o] = b.family[i]; regime[o] = b.regime[i]; atr[o] = b.atr[i]; vdev[o] = b.vdev[i]
+                trend[o] = b.trend[i]; score[o] = b.score[i]
+                System.arraycopy(b.pnl, i * nk, pnl, o * nk, nk); System.arraycopy(b.reason, i * nk, reason, o * nk, nk)
+                System.arraycopy(b.closeE, i * nk, closeE, o * nk, nk)
+                for (f in 0 until nf) cols[f][o] = b.x[i * nf + f]
+                n++
+            }
+            b.release()
+        }
+
+        /** 容量按精确行数一次分配,正常不会扩容 */
+        private fun grow(need: Int) {
+            val c = maxOf(need, (cap * 1.25).toInt())
+            symbol = symbol.copyOf(c); date = date.copyOf(c); elapsed = elapsed.copyOf(c); dir = dir.copyOf(c)
+            family = family.copyOf(c); regime = regime.copyOf(c); atr = atr.copyOf(c); vdev = vdev.copyOf(c)
+            trend = trend.copyOf(c); score = score.copyOf(c)
+            pnl = pnl.copyOf(c * nk); reason = reason.copyOf(c * nk); closeE = closeE.copyOf(c * nk)
+            for (f in 0 until nf) cols[f] = cols[f].copyOf(c)
+            cap = c
+        }
+
+        fun cands() = Cands(n, nk, symbol, date, elapsed, dir, family, regime, atr, vdev, trend, score, pnl, reason, closeE)
+    }
+
+    /**
+     * 候选点临时文件:候选生成时每只股票算完立即写盘,结束后得到精确行数,再一次性按精确容量载入。
+     * 这样内存里同时只有"每线程一只股票"的数据,不依赖抽样估算,也不会因扩容瞬间占用双倍内存。
+     */
+    private class Spill(val file: File, val nf: Int, val nk: Int) {
+        private val ch = java.nio.channels.FileChannel.open(file.toPath(),
+            java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.TRUNCATE_EXISTING,
+            java.nio.file.StandardOpenOption.READ, java.nio.file.StandardOpenOption.WRITE)
+        var rows = 0L; private set
+
+        private fun bytes(n: Int) = n * (4 + 2 + 3 + 16 + nf + nk * 7)
+
+        @Synchronized
+        fun write(b: Block) {
+            if (b.n == 0) return
+            val buf = java.nio.ByteBuffer.allocate(8 + bytes(b.n))
+            buf.putInt(b.symbol).putInt(b.n)
+            val n = b.n
+            buf.asIntBuffer().put(b.date, 0, n); buf.position(buf.position() + n * 4)
+            buf.asShortBuffer().put(b.elapsed, 0, n); buf.position(buf.position() + n * 2)
+            buf.put(b.dir, 0, n).put(b.family, 0, n).put(b.regime, 0, n)
+            for (a in arrayOf(b.atr, b.vdev, b.trend, b.score)) { buf.asFloatBuffer().put(a, 0, n); buf.position(buf.position() + n * 4) }
+            buf.put(b.x, 0, n * nf)
+            buf.asFloatBuffer().put(b.pnl, 0, n * nk); buf.position(buf.position() + n * nk * 4)
+            buf.put(b.reason, 0, n * nk)
+            buf.asShortBuffer().put(b.closeE, 0, n * nk); buf.position(buf.position() + n * nk * 2)
+            buf.flip()
+            while (buf.hasRemaining()) ch.write(buf)
+            rows += n
+        }
+
+        val sizeBytes get() = ch.size()
+
+        /** 顺序读回每一块 */
+        fun readAll(each: (Block) -> Unit) {
+            ch.position(0)
+            val hdr = java.nio.ByteBuffer.allocate(8)
+            while (true) {
+                hdr.clear()
+                if (!readFully(hdr)) break
+                hdr.flip()
+                val sym = hdr.getInt(); val n = hdr.getInt()
+                val buf = java.nio.ByteBuffer.allocate(bytes(n))
+                check(readFully(buf)) { "候选点临时文件损坏: $file" }
+                buf.flip()
+                val b = Block(sym, n, nf, nk)
+                b.n = n
+                buf.asIntBuffer().get(b.date, 0, n); buf.position(buf.position() + n * 4)
+                buf.asShortBuffer().get(b.elapsed, 0, n); buf.position(buf.position() + n * 2)
+                buf.get(b.dir, 0, n).get(b.family, 0, n).get(b.regime, 0, n)
+                for (a in arrayOf(b.atr, b.vdev, b.trend, b.score)) { buf.asFloatBuffer().get(a, 0, n); buf.position(buf.position() + n * 4) }
+                buf.get(b.x, 0, n * nf)
+                buf.asFloatBuffer().get(b.pnl, 0, n * nk); buf.position(buf.position() + n * nk * 4)
+                buf.get(b.reason, 0, n * nk)
+                buf.asShortBuffer().get(b.closeE, 0, n * nk)
+                each(b)
+            }
+        }
+
+        private fun readFully(buf: java.nio.ByteBuffer): Boolean {
+            while (buf.hasRemaining()) if (ch.read(buf) < 0) return false
+            return true
+        }
+
+        fun delete() {
+            runCatching { ch.close() }
+            file.delete()
+        }
+    }
+
     private class Cands(
         val n: Int, val nk: Int, val symbol: IntArray, val date: IntArray, val elapsed: ShortArray, val dir: ByteArray,
         val family: ByteArray, val regime: ByteArray, val atr: FloatArray, val vdev: FloatArray, val trend: FloatArray,
@@ -149,55 +280,81 @@ class Trainer(
             e.toDoubleArray()
         }
         sampleX.clear()
-        // 内存预算:每个候选点约 = 特征 nf 字节 + 每组离场 7 字节 + 属性 34 字节 + 训练期工作区
-        val perCand = nf + nk * 7 + 34 + 70 + 12L * minOf(threads, 8)
+        // 内存预算(每个候选点):特征 nf 字节 + 每组离场 7 字节 + 属性约 30 字节
+        //   + 训练期工作区(分段/两个模型概率/消融预测/标签/行号)约 100 字节;另留 30% 给并行训练的 GBDT 与 GC
+        val perCand = nf + nk * 7 + 30 + 100L
         val estDays = sampleSetups.get().toDouble() / sampleSyms.size * symbols.size
         val estCands = estDays * sampleCands.get() / maxOf(1L, sampleDays.get())
         val budget = maxMem * 0.7 - 150e6
-        val keep = if (estCands * perCand <= budget) 1.0 else (budget / (estCands * perCand)).coerceIn(0.05, 1.0)
+        // 预抽样只用于明显装不下时少算一些(留 30% 余量),最终保留比例按写盘后的精确行数确定
+        val keep0 = if (estCands * perCand <= budget * 1.3) 1.0 else (budget * 1.3 / (estCands * perCand)).coerceIn(0.05, 1.0)
         progress.finish("预计候选点约 ${"%,d".format(estCands.toLong())},需内存约 ${gb(estCands * perCand + 150e6)},可用上限 ${gb(maxMem.toDouble())}")
+
+        // ---------- 2. 候选生成(特征直接分箱;每只股票算完立即写入临时文件,内存只保留各线程当前那一只)----------
+        outDir.mkdirs()
+        val spill = Spill(File(outDir, "candidates.tmp"), nf, nk)
+        val dayCount = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+        val dayRows = java.util.concurrent.ConcurrentHashMap<Long, Int>() // (股票, 日期) → 候选点数
+        val done = AtomicInteger()
+        val failed = AtomicInteger()
+        try {
+            progress.start("2/6 候选生成", symbols.size)
+            runParallel(symbols.indices.map { si ->
+                Callable {
+                    val blk = Block(si, 1024, nf, nk)
+                    try {
+                        for (su in bt.setups(symbols[si])) {
+                            dayCount.merge(su.date, 1, Int::plus)
+                            if (keep0 < 1.0 && keepHash(si, su.date) >= keep0) continue
+                            val before = blk.n
+                            candidatesOf(su, grid, blk, edges)
+                            if (blk.n > before) dayRows[si.toLong() shl 32 or su.date.toLong()] = blk.n - before
+                        }
+                    } catch (e: OutOfMemoryError) {
+                        throw e
+                    } catch (e: Exception) {
+                        failed.incrementAndGet()
+                        progress.log("  ${symbols[si]} 跳过: $e")
+                    }
+                    spill.write(blk)
+                    blk.release()
+                    progress.step(done.incrementAndGet(), "候选点 ${"%,d".format(spill.rows)} | 内存 ${memText()}")
+                }
+            })
+            progress.finish("候选点 ${"%,d".format(spill.rows)} | 临时文件 ${gb(spill.sizeBytes.toDouble())} | 内存 ${memText()}")
+            if (failed.get() > 0) progress.log("  共 ${failed.get()} 只股票数据异常已跳过")
+        } catch (e: Throwable) {
+            spill.delete()
+            throw e
+        }
+
+        // 按精确行数确定最终保留比例(整日保留),一次性分配全局存储并载入
+        val exact = spill.rows
+        val keep = if (exact * perCand <= budget) keep0 else (keep0 * budget / (exact * perCand)).coerceIn(0.01, keep0)
         if (keep < 1.0) progress.log("内存不足以容纳全部数据:随机保留 ${pct(keep)} 的「股票·交易日」(整日保留,不影响当日规则)。" +
             "若想用全部数据,请减少 --sample 或增大可用内存(见 README)。")
-
-        // ---------- 2. 候选生成(特征直接分箱存储)----------
-        val blocks = java.util.Collections.synchronizedList(ArrayList<Block>())
-        val dayCount = java.util.concurrent.ConcurrentHashMap<Int, Int>()
-        val done = AtomicInteger(); val candCount = AtomicLong()
-        progress.start("2/6 候选生成", symbols.size)
-        runParallel(symbols.indices.map { si ->
-            Callable {
-                val blk = Block(si, 1024, nf, nk)
-                try {
-                    for (su in bt.setups(symbols[si])) {
-                        dayCount.merge(su.date, 1, Int::plus)
-                        if (keep < 1.0 && keepHash(si, su.date) >= keep) continue
-                        candidatesOf(su, grid, blk, edges)
-                    }
-                } catch (e: OutOfMemoryError) {
-                    throw e
-                } catch (e: Exception) {
-                    progress.log("  ${symbols[si]} 失败: $e")
-                }
-                blocks += blk
-                candCount.addAndGet(blk.n.toLong())
-                progress.step(done.incrementAndGet(), "候选点 ${"%,d".format(candCount.get())}")
-            }
-        })
-        progress.finish("候选点 ${"%,d".format(candCount.get())}")
+        fun keepDay(si: Int, date: Int) = keep >= keep0 || keepHash(si, date) < keep
+        var cap = 0L
+        for ((key, cnt) in dayRows) if (keepDay((key ushr 32).toInt(), key.toInt())) cap += cnt
+        require(cap * maxOf(nf, nk) < Int.MAX_VALUE) { "候选点过多(${"%,d".format(cap)}),请减少 --sample" }
+        val store: Store
+        try {
+            System.gc()
+            store = Store(nf, nk, maxOf(1L, cap).toInt())
+            spill.readAll { b -> store.append(b, if (keep >= keep0) null else { r -> keepHash(b.symbol, b.date[r]) < keep }) }
+        } finally {
+            spill.delete()
+        }
+        progress.log("载入候选点 ${"%,d".format(store.n)} | 内存 ${memText()}")
 
         val dates = dayCount.keys.sorted()
         require(dates.size >= 30) { "交易日太少(${dates.size}),至少需要 30 个交易日的 1 分钟数据" }
         val foldStarts = listOf(0.40, 0.55, 0.70, 0.85).map { dates[(dates.size * it).toInt()] }
         val searchStart = foldStarts[0]; val valStart = foldStarts[2]; val holdStart = foldStarts[3]
-
-        val sorted = blocks.sortedBy { it.symbol }
-        blocks.clear()
-        val n = sorted.sumOf { it.n }
+        val n = store.n
         require(n >= 2000) { "候选点太少($n),请增加股票数量或数据天数" }
-        val offs = IntArray(sorted.size + 1).also { for (i in sorted.indices) it[i + 1] = it[i] + sorted[i].n }
-        val cols = Array(nf) { ByteArray(n) }
-        val c = merge(sorted, offs, n, nk, cols) // 合并时逐块释放,避免内存翻倍
-        val bd = BinnedData(edges, cols)
+        val c = store.cands()
+        val bd = BinnedData(edges, store.cols)
         val foldOf = IntArray(n) { r -> foldStarts.indexOfLast { c.date[r] >= it } }
         progress.log("时间切分:模型训练 ${dates.first()}~<$searchStart | 寻优 $searchStart~<$valStart | 验证 $valStart~<$holdStart | 验收 $holdStart~${dates.last()}")
 
@@ -211,7 +368,7 @@ class Trainer(
         val jobs3 = (0..1).flatMap { m -> (0 until 4).map { f -> m to f } }
         val done3 = AtomicInteger()
         progress.start("3/6 胜率模型", jobs3.size)
-        runParallel(jobs3.map { (m, f) ->
+        runParallel(parallelism = modelParallelism(n), tasks = jobs3.map { (m, f) ->
             Callable {
                 val fm = trainFold(bd, c, dates, foldStarts, modelK[m], f, modelCols, screen = false)
                 for ((i, r) in fm.rows.withIndex()) prob[m][r] = fm.pred[i]
@@ -221,9 +378,9 @@ class Trainer(
             }
         })
         progress.finish()
-        val searchRows = sortRows(c, (0 until n).filter { foldOf[it] in 0..1 })
-        val valRows = sortRows(c, (0 until n).filter { foldOf[it] == 2 })
-        val holdRows = sortRows(c, (0 until n).filter { foldOf[it] == 3 })
+        val searchRows = rowsWhere(n) { foldOf[it] in 0..1 }
+        val valRows = rowsWhere(n) { foldOf[it] == 2 }
+        val holdRows = rowsWhere(n) { foldOf[it] == 3 }
         val modelAuc = (0..1).map { m -> auc(c, searchRows + valRows, prob[m], modelK[m]) }
 
         // ---------- 4. 模块消融(仅在寻优期,模型A)----------
@@ -234,7 +391,7 @@ class Trainer(
             val jobs4 = groups.flatMap { g -> (0..1).map { f -> g to f } }
             val done4 = AtomicInteger()
             progress.start("4/6 模块消融", jobs4.size)
-            runParallel(jobs4.map { (g, f) ->
+            runParallel(parallelism = modelParallelism(n), tasks = jobs4.map { (g, f) ->
                 Callable {
                     val cs = modelCols.filter { Features.specs[it].group != g }.toIntArray()
                     val fm = trainFold(bd, c, dates, foldStarts, modelK[0], f, cs, screen = true)
@@ -247,7 +404,7 @@ class Trainer(
             val full = auc(c, searchRows, prob[0], modelK[0])
             for (g in groups) {
                 val arr = ablP.getValue(g)
-                val a = auc(c, searchRows, DoubleArray(n) { arr[it].toDouble() }, modelK[0])
+                val a = auc(c, searchRows, modelK[0]) { arr[it].toDouble() }
                 abl += Triple(g, a, a - full)
             }
         }
@@ -344,6 +501,7 @@ class Trainer(
             appendLine()
             appendLine("- 标的 ${symbols.size} 只,交易日 ${dates.first()} ~ ${dates.last()}(${dates.size} 天),候选点 ${"%,d".format(n)},用时 ${"%.1f".format(minutes)} 分钟($threads 线程)")
             appendLine("- 费率:佣金 ${feeText(cfg.costs.commissionRate)}(最低 ${cfg.costs.minCommission} 元)、印花税 ${feeText(cfg.costs.stampDutyRate)}(仅卖出)、过户费 ${feeText(cfg.costs.transferRate)}、滑点单边 ${feeText(cfg.costs.slippage)};只做当日T")
+            if (keep < 1.0) appendLine("- 内存限制:按「股票·交易日」随机保留 ${pct(keep)} 的数据参与训练")
             appendLine("- 指数分时数据:${if (data.hasIndexMinutes) "有" else "**无**"}")
             appendLine("- 时间切分:模型训练 < $searchStart | **寻优** $searchStart~ | **二次验证** $valStart~ | **最终验收** $holdStart~${dates.last()}(只用一次)")
             appendLine("- 目标:胜率 ≥ ${pct(target)} 且净盈亏 > 0;寻优期至少 $minTrades 笔,验证期至少 $minValTrades 笔")
@@ -388,9 +546,9 @@ class Trainer(
             appendLine()
             appendLine("| 维度 | 取值 | 次数 | 胜率 | 平均(bp) | 净盈亏 |")
             appendLine("|---|---|---|---|---|---|")
-            val sv = searchRows + valRows
+            val sv = (searchRows + valRows).also { it.sort() }
             fun dimRow(dim: String, name: String, spec: StrategySpec) {
-                val e = simulateGene(c, sortRows(c, sv.toList()), Gene(spec, finalGene.k, 0), prob, grid)
+                val e = simulateGene(c, sv, Gene(spec, finalGene.k, 0), prob, grid)
                 appendLine("| $dim | $name | ${e.n} | ${pct(e.winRate)} | ${f1(e.avgBp)} | ${f0(e.pnl)} |")
             }
             listOf("缠论1分钟" to 1, "布林刺破收回" to 2, "RSI拐头" to 4, "缠论5分钟" to 8).forEach { (nm, m) -> dimRow("信号来源", nm, StrategySpec(families = m)) }
@@ -419,7 +577,7 @@ class Trainer(
             appendLine()
             appendLine("## 5. 最终策略亏损单(寻优期 + 验证期)")
             appendLine()
-            val tk = takenRows(c, sortRows(c, sv.toList()), finalGene, prob, grid)
+            val tk = takenRows(c, sv, finalGene, prob, grid)
             val losers = tk.filter { c.pnl(it, finalGene.k) <= 0 }
             appendLine("出手 ${tk.size} 笔中亏损 ${losers.size} 笔:")
             appendLine()
@@ -517,9 +675,14 @@ class Trainer(
     }
 
     // ---------------- 模拟出手(与实盘引擎规则一致)----------------
-    /** 行按 股票→日期→时间→方向 排序,便于线性扫描 */
-    private fun sortRows(c: Cands, rows: List<Int>): IntArray =
-        rows.sortedWith(compareBy<Int>({ c.symbol[it] }, { c.date[it] }, { c.elapsed[it] }, { c.dir[it] })).toIntArray()
+    /** 满足条件的行号(按存储顺序:同一股票连续、时间先后有序,可直接线性扫描) */
+    private inline fun rowsWhere(n: Int, pred: (Int) -> Boolean): IntArray {
+        var cnt = 0
+        for (r in 0 until n) if (pred(r)) cnt++
+        val out = IntArray(cnt); var i = 0
+        for (r in 0 until n) if (pred(r)) out[i++] = r
+        return out
+    }
 
     private fun passes(c: Cands, r: Int, g: Gene, prob: Array<DoubleArray>): Boolean {
         if (!c.filled(r, g.k)) return false
@@ -575,6 +738,13 @@ class Trainer(
     // ---------------- 模型训练(单段)----------------
     private class FoldModel(val model: Gbdt, val calib: Calibration, val rows: IntArray, val pred: DoubleArray)
 
+    private val labelCache = java.util.concurrent.ConcurrentHashMap<Int, ByteArray>()
+
+    /** 某离场组下的输赢标签(各段、各模型共享同一份) */
+    private fun labels(c: Cands, k: Int): ByteArray = labelCache.getOrPut(k) {
+        ByteArray(c.n) { r -> if (c.filled(r, k) && c.pnl(r, k) > 0) 1 else 0 }
+    }
+
     private fun trainFold(
         bd: BinnedData, c: Cands, dates: List<Int>, foldStarts: List<Int>,
         k: Int, f: Int, cols: IntArray?, screen: Boolean,
@@ -583,19 +753,15 @@ class Trainer(
         val end = if (f + 1 < foldStarts.size) foldStarts[f + 1] else Int.MAX_VALUE
         val trainDates = dates.filter { it < start }
         val esStart = trainDates[(trainDates.size * 0.85).toInt().coerceAtMost(trainDates.size - 1)]
-        val y = ByteArray(c.n) { r -> if (c.filled(r, k) && c.pnl(r, k) > 0) 1 else 0 }
-        val tr = ArrayList<Int>(); val es = ArrayList<Int>(); val pr = ArrayList<Int>()
-        for (r in 0 until c.n) {
-            val d = c.date[r]
-            if (d >= start && d < end) { pr += r; continue }
-            if (!c.filled(r, k)) continue
-            if (d < esStart) tr += r else if (d < start) es += r
-        }
-        val m = Gbdt.trainBinned(bd, y, tr.toIntArray(), es.toIntArray(), cols, gbdtParams(screen).copy(seed = 7 + k * 31 + f))
+        val y = labels(c, k)
+        val inPred = { r: Int -> c.date[r] >= start && c.date[r] < end }
+        val tr = rowsWhere(c.n) { c.filled(it, k) && c.date[it] < esStart }
+        val es = rowsWhere(c.n) { c.filled(it, k) && c.date[it] >= esStart && c.date[it] < start }
+        val pr = rowsWhere(c.n) { inPred(it) }
+        val m = Gbdt.trainBinned(bd, y, tr, es, cols, gbdtParams(screen).copy(seed = 7 + k * 31 + f))
         val esScores = DoubleArray(es.size) { m.predictBinned(bd, es[it]) }
         val calib = Calibration.fit(esScores, IntArray(es.size) { y[es[it]].toInt() })
-        val rows = pr.toIntArray()
-        return FoldModel(m, calib, rows, DoubleArray(rows.size) { calib.apply(m.predictBinned(bd, rows[it])) })
+        return FoldModel(m, calib, pr, DoubleArray(pr.size) { calib.apply(m.predictBinned(bd, pr[it])) })
     }
 
     // ---------------- 候选生成与打标签 ----------------
@@ -676,47 +842,46 @@ class Trainer(
         }
     }
 
-    /** 合并各股票的候选点;每合并完一块立即释放它,峰值内存不翻倍 */
-    private fun merge(sorted: List<Block>, offs: IntArray, n: Int, nk: Int, cols: Array<ByteArray>): Cands {
-        val nf = cols.size
-        val sym = IntArray(n); val date = IntArray(n); val el = ShortArray(n); val dir = ByteArray(n); val fam = ByteArray(n)
-        val reg = ByteArray(n); val atr = FloatArray(n); val vdev = FloatArray(n); val trend = FloatArray(n); val score = FloatArray(n)
-        val pnl = FloatArray(n * nk); val rsn = ByteArray(n * nk); val ce = ShortArray(n * nk)
-        for ((bi, b) in sorted.withIndex()) {
-            val o = offs[bi]
-            java.util.Arrays.fill(sym, o, o + b.n, b.symbol)
-            System.arraycopy(b.date, 0, date, o, b.n); System.arraycopy(b.elapsed, 0, el, o, b.n)
-            System.arraycopy(b.dir, 0, dir, o, b.n); System.arraycopy(b.family, 0, fam, o, b.n)
-            System.arraycopy(b.regime, 0, reg, o, b.n); System.arraycopy(b.atr, 0, atr, o, b.n)
-            System.arraycopy(b.vdev, 0, vdev, o, b.n); System.arraycopy(b.trend, 0, trend, o, b.n)
-            System.arraycopy(b.score, 0, score, o, b.n)
-            System.arraycopy(b.pnl, 0, pnl, o * nk, b.n * nk); System.arraycopy(b.reason, 0, rsn, o * nk, b.n * nk)
-            System.arraycopy(b.closeE, 0, ce, o * nk, b.n * nk)
-            for (i in 0 until b.n) for (f in 0 until nf) cols[f][o + i] = b.x[i * nf + f]
-            b.release()
-        }
-        return Cands(n, nk, sym, date, el, dir, fam, reg, atr, vdev, trend, score, pnl, rsn, ce)
-    }
-
     /** 样本外 AUC(越高说明模型越能区分赢单与输单) */
-    private fun auc(c: Cands, rows: IntArray, p: DoubleArray, k: Int): Double {
-        val rs = rows.filter { !p[it].isNaN() && c.filled(it, k) }.sortedBy { p[it] }
-        var pos = 0L; var neg = 0L; var rankSum = 0.0
-        var i = 0
-        while (i < rs.size) {
-            var j = i
-            while (j + 1 < rs.size && p[rs[j + 1]] == p[rs[i]]) j++
-            val avgRank = (i + j) / 2.0 + 1
-            for (t in i..j) if (c.pnl(rs[t], k) > 0) { pos++; rankSum += avgRank } else neg++
-            i = j + 1
+    private fun auc(c: Cands, rows: IntArray, p: DoubleArray, k: Int): Double = auc(c, rows, k) { p[it] }
+
+    private inline fun auc(c: Cands, rows: IntArray, k: Int, p: (Int) -> Double): Double {
+        // 正负样本分数各自排序后归并计数(Mann-Whitney U),不装箱
+        var np = 0; var nn = 0
+        for (r in rows) if (!p(r).isNaN() && c.filled(r, k)) { if (c.pnl(r, k) > 0) np++ else nn++ }
+        if (np == 0 || nn == 0) return 0.5
+        val pos = DoubleArray(np); val neg = DoubleArray(nn); var i = 0; var j = 0
+        for (r in rows) if (!p(r).isNaN() && c.filled(r, k)) { if (c.pnl(r, k) > 0) pos[i++] = p(r) else neg[j++] = p(r) }
+        pos.sort(); neg.sort()
+        var u = 0.0; var lo = 0; var hi = 0
+        for (x in pos) {
+            while (lo < nn && neg[lo] < x) lo++
+            while (hi < nn && neg[hi] <= x) hi++
+            u += lo + (hi - lo) * 0.5
         }
-        if (pos == 0L || neg == 0L) return 0.5
-        return (rankSum - pos * (pos + 1) / 2.0) / (pos.toDouble() * neg)
+        return u / (np.toDouble() * nn)
     }
 
-    private fun runParallel(tasks: List<Callable<Unit>>) {
+    /**
+     * 训练任务可同时运行的个数,按剩余内存限制并发。每个 GBDT 任务约需 行数 × 28 字节:
+     * 间隔/梯度/二阶导 12 + 训练/早停/预测行号 4 + 行抽样与节点划分 8 + 预测结果 4。
+     */
+    private fun modelParallelism(n: Int): Int {
+        val rt = Runtime.getRuntime()
+        System.gc()
+        val free = rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())
+        val perJob = n * 28L + 60_000_000L
+        return (free * 0.8 / perJob).toInt().coerceIn(1, threads)
+    }
+
+    private fun memText(): String {
+        val rt = Runtime.getRuntime()
+        return "%.1f/%.1fGB".format((rt.totalMemory() - rt.freeMemory()) / 1e9, rt.maxMemory() / 1e9)
+    }
+
+    private fun runParallel(tasks: List<Callable<Unit>>, parallelism: Int = threads) {
         if (tasks.isEmpty()) return
-        val pool = Executors.newFixedThreadPool(threads)
+        val pool = Executors.newFixedThreadPool(parallelism.coerceIn(1, threads))
         try {
             pool.invokeAll(tasks).forEach { it.get() }
         } finally {
