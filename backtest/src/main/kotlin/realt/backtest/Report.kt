@@ -19,8 +19,8 @@ data class TStats(
 ) {
     val winRate: Double get() = if (n == 0) 0.0 else wins.toDouble() / n
 
-    /** 达标:胜率 ≥ 目标 且 扣费后期望为正 */
-    fun meets(target: Double) = n > 0 && winRate >= target && netPnl > 0
+    /** 达标:胜率 ≥ 目标 且 平均每次 ≥ minBp(扣费后)且 净盈亏为正 */
+    fun meets(target: Double, minBp: Double = 0.0) = n > 0 && winRate >= target && avgRetBps >= minBp && netPnl > 0
 
     companion object {
         fun of(trades: List<Pair<Symbol, TTrade>>, costs: Costs): TStats {
@@ -48,6 +48,7 @@ class Report(
     private val costs: Costs,
     private val target: Double,
     private val model: TradeModel? = null,
+    private val minBp: Double = 0.0,
 ) {
     private val totalDays = records.size
     private val raw = records.flatMap { r -> r.trades.map { r.symbol to it } }
@@ -61,7 +62,7 @@ class Report(
         appendLine("# realT 回测报告")
         appendLine()
         appendLine("- 标的数:${symbols.size}  交易日:${dates.firstOrNull() ?: "-"} ~ ${dates.lastOrNull() ?: "-"}  个股·日样本:$totalDays")
-        appendLine("- 目标:出手胜率 ≥ ${pct(target)} 且扣费后期望为正")
+        appendLine("- 目标:出手胜率 ≥ ${pct(target)}" + (if (minBp > 0) " 且扣费后平均每次 ≥ ${f1(minBp)}bp" else "") + ",净盈亏为正")
         appendLine("- 成交假设:信号出现后下一根 1 分钟线开盘价成交,单边滑点 ${Trainer.feeText(costs.slippage)}")
         appendLine("- 费率:佣金 ${Trainer.feeText(costs.commissionRate)}(双向,单笔最低 ${costs.minCommission} 元),印花税 ${Trainer.feeText(costs.stampDutyRate)}(仅卖出),过户费 ${Trainer.feeText(costs.transferRate)}(双向);一次完整做T(一买一卖)合计约 ${pct(costs.roundTripRate - 2 * costs.slippage, 3)} + 滑点 ${pct(2 * costs.slippage, 2)}")
         appendLine()
@@ -150,8 +151,8 @@ class Report(
         for (sym in symbols) {
             val s = TStats.of(taken.filter { it.first == sym }, costs)
             val b = TStats.of(base.filter { it.first == sym }, costs)
-            if (s.meets(target)) ok++
-            appendLine("| $sym | ${records.count { it.symbol == sym }} | ${s.n} | ${pct(s.winRate)} | ${f1(s.avgRetBps)} | ${f0(s.netPnl)} | ${if (s.meets(target)) "√" else if (s.n == 0) "-" else "×"} | ${b.n} | ${pct(b.winRate)} | ${f0(b.netPnl)} |")
+            if (s.meets(target, minBp)) ok++
+            appendLine("| $sym | ${records.count { it.symbol == sym }} | ${s.n} | ${pct(s.winRate)} | ${f1(s.avgRetBps)} | ${f0(s.netPnl)} | ${if (s.meets(target, minBp)) "√" else if (s.n == 0) "-" else "×"} | ${b.n} | ${pct(b.winRate)} | ${f0(b.netPnl)} |")
         }
         appendLine()
         appendLine("达标股票:$ok / ${symbols.size}")
@@ -167,7 +168,7 @@ class Report(
     }
 
     private fun StringBuilder.row(name: String, s: TStats, days: Int = totalDays) {
-        appendLine("| $name | ${s.n} | ${pct(s.winRate)} | ${f1(s.avgRetBps)} | ${f0(s.netPnl)} | ${f0(s.maxLoss)} | ${"%.2f".format(s.profitFactor)} | ${pct(if (days > 0) s.daysTraded.toDouble() / days else 0.0)} | ${if (s.meets(target)) "√" else "×"} |")
+        appendLine("| $name | ${s.n} | ${pct(s.winRate)} | ${f1(s.avgRetBps)} | ${f0(s.netPnl)} | ${f0(s.maxLoss)} | ${"%.2f".format(s.profitFactor)} | ${pct(if (days > 0) s.daysTraded.toDouble() / days else 0.0)} | ${if (s.meets(target, minBp)) "√" else "×"} |")
     }
 
     private fun StringBuilder.group(dim: String, ts: List<Pair<Symbol, TTrade>>, key: (Pair<Symbol, TTrade>) -> String) {

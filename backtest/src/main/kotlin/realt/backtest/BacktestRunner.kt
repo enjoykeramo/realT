@@ -22,6 +22,8 @@ class BacktestRunner(
     private val targetWinRate: Double = 0.8,
     private val threads: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
     private val progress: Progress? = null,
+    /** 每次做T扣费后平均收益目标(bp),0 表示只要求为正 */
+    private val minBp: Double = 0.0,
 ) {
     fun run(symbols: List<Symbol>, outDir: File?): RunResult {
         val bt = Backtester(data, cfg)
@@ -47,7 +49,7 @@ class BacktestRunner(
             // 参数包模式:出手已由模型决定,不再叠加 L6 记忆门控
             sorted.flatMap { r -> r.trades.map { GatedTrade(r.symbol, it, true) } } to ContextMemory()
         } else MemoryReplay(cfg.costs, ContextMemory(targetWinRate = targetWinRate)).run(sorted)
-        val report = Report(sorted, gated, memory, cfg.costs, targetWinRate, cfg.model)
+        val report = Report(sorted, gated, memory, cfg.costs, targetWinRate, cfg.model, minBp)
         if (outDir != null) {
             outDir.mkdirs()
             File(outDir, "report.md").writeText(report.markdown())

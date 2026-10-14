@@ -42,7 +42,8 @@ backtest 选项:
   --base 100000                 每只股票底仓市值(元)
   --t-ratio 0.3                 T 仓占底仓比例
   --max-t 2                     每日最多做T次数
-  --target 0.95                 目标胜率(train 默认 0.95,backtest/sweep 默认 0.8)
+  --target 0.9                  目标胜率(train 默认 0.9;backtest 默认取参数包的目标,无参数包时 0.8)
+  --min-bp 10                   每笔利润目标:扣费后平均每次做T ≥ N 个基点(1bp = 0.01%;train 默认 10)
   --model realt-model.txt       使用 train 产出的参数包(backtest / replay)
   --params best.properties      加载规则参数文件(sweep 产出),命令行参数优先
 
@@ -305,9 +306,10 @@ private fun train(o: Map<String, String>) {
     println("训练 ${symbols.size} 只股票 → ${out.absolutePath}(Java 可用内存上限 %.1fGB)".format(Runtime.getRuntime().maxMemory() / 1e9))
     println("费率: ${describeCosts(cfg.costs)}")
     val data = MarketData(r, out, useBreadth = o["no-breadth"] == null, log = ::println)
-    val target = o["target"]?.toDouble() ?: 0.95
+    val target = o["target"]?.toDouble() ?: 0.9
+    val minBp = o["min-bp"]?.toDouble() ?: 10.0
     val res = Trainer(
-        data, cfg, target,
+        data, cfg, target, minBp,
         rounds = o["rounds"]?.toInt() ?: 60,
         population = o["population"]?.toInt() ?: 400,
         minTrades = o["min-trades"]?.toInt() ?: 30,
@@ -343,8 +345,10 @@ private fun backtest(o: Map<String, String>) {
     println("费率: ${describeCosts(cfg.costs)}")
     cfg.model?.let { println("参数包: 阈值 ${it.threshold},训练数据截止 ${it.trainEnd}(之后的日期为样本外)") }
     val data = MarketData(r, out, useBreadth = o["no-breadth"] == null, log = ::println)
-    val target = o["target"]?.toDouble() ?: 0.8
-    val res = BacktestRunner(data, cfg, target, threads(o), Progress()).run(symbols, out)
+    // 有参数包时默认沿用训练时的双目标(胜率 + 每笔利润)
+    val target = o["target"]?.toDouble() ?: cfg.model?.meta?.get("target")?.toDoubleOrNull() ?: 0.8
+    val minBp = o["min-bp"]?.toDouble() ?: cfg.model?.meta?.get("minBp")?.toDoubleOrNull() ?: 0.0
+    val res = BacktestRunner(data, cfg, target, threads(o), Progress(), minBp).run(symbols, out)
     println()
     println(res.report.markdown().lineSequence().takeWhile { !it.startsWith("## 2") && !it.startsWith("## 3") }.joinToString("\n"))
     println("完整报告: ${File(out, "report.md").absolutePath}")

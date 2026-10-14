@@ -37,7 +37,9 @@ import kotlin.random.Random
 class Trainer(
     private val data: MarketData,
     private val cfg: BacktestConfig,
-    private val target: Double = 0.95,
+    private val target: Double = 0.90,
+    /** 每笔利润目标:扣除全部费用后平均每笔 ≥ minBp 个基点(1bp = 0.01%) */
+    private val minBp: Double = 10.0,
     private val minTrades: Int = 30,
     private val minValTrades: Int = 30,
     private val rounds: Int = 60,
@@ -53,6 +55,8 @@ class Trainer(
         var n = 0
         var date = IntArray(cap); var elapsed = ShortArray(cap); var dir = ByteArray(cap); var family = ByteArray(cap)
         var regime = ByteArray(cap); var atr = FloatArray(cap); var vdev = FloatArray(cap); var trend = FloatArray(cap); var score = FloatArray(cap)
+        /** 实际成交金额(T 仓股数 × 开仓价),用于按成交金额计算每笔收益率(与回测报告一致) */
+        var value = FloatArray(cap)
         /** 特征分箱后的箱号(每值 1 字节) */
         var x = ByteArray(cap * nf); var pnl = FloatArray(cap * nk); var reason = ByteArray(cap * nk); var closeE = ShortArray(cap * nk)
         fun ensure() {
@@ -60,11 +64,12 @@ class Trainer(
             val c = date.size * 2
             date = date.copyOf(c); elapsed = elapsed.copyOf(c); dir = dir.copyOf(c); family = family.copyOf(c)
             regime = regime.copyOf(c); atr = atr.copyOf(c); vdev = vdev.copyOf(c); trend = trend.copyOf(c); score = score.copyOf(c)
+            value = value.copyOf(c)
             x = x.copyOf(c * nf); pnl = pnl.copyOf(c * nk); reason = reason.copyOf(c * nk); closeE = closeE.copyOf(c * nk)
         }
         fun release() {
             date = IntArray(0); elapsed = ShortArray(0); dir = ByteArray(0); family = ByteArray(0); regime = ByteArray(0)
-            atr = FloatArray(0); vdev = FloatArray(0); trend = FloatArray(0); score = FloatArray(0)
+            atr = FloatArray(0); vdev = FloatArray(0); trend = FloatArray(0); score = FloatArray(0); value = FloatArray(0)
             x = ByteArray(0); pnl = FloatArray(0); reason = ByteArray(0); closeE = ShortArray(0)
         }
     }
@@ -75,7 +80,7 @@ class Trainer(
         private var cap = cap0
         var symbol = IntArray(cap); var date = IntArray(cap); var elapsed = ShortArray(cap); var dir = ByteArray(cap)
         var family = ByteArray(cap); var regime = ByteArray(cap); var atr = FloatArray(cap); var vdev = FloatArray(cap)
-        var trend = FloatArray(cap); var score = FloatArray(cap)
+        var trend = FloatArray(cap); var score = FloatArray(cap); var value = FloatArray(cap)
         var pnl = FloatArray(cap * nk); var reason = ByteArray(cap * nk); var closeE = ShortArray(cap * nk)
         var cols = Array(nf) { ByteArray(cap) }
 
@@ -90,7 +95,7 @@ class Trainer(
             System.arraycopy(b.dir, 0, dir, o, b.n); System.arraycopy(b.family, 0, family, o, b.n)
             System.arraycopy(b.regime, 0, regime, o, b.n); System.arraycopy(b.atr, 0, atr, o, b.n)
             System.arraycopy(b.vdev, 0, vdev, o, b.n); System.arraycopy(b.trend, 0, trend, o, b.n)
-            System.arraycopy(b.score, 0, score, o, b.n)
+            System.arraycopy(b.score, 0, score, o, b.n); System.arraycopy(b.value, 0, value, o, b.n)
             System.arraycopy(b.pnl, 0, pnl, o * nk, b.n * nk); System.arraycopy(b.reason, 0, reason, o * nk, b.n * nk)
             System.arraycopy(b.closeE, 0, closeE, o * nk, b.n * nk)
             for (f in 0 until nf) { val col = cols[f]; for (i in 0 until b.n) col[o + i] = b.x[i * nf + f] }
@@ -107,7 +112,7 @@ class Trainer(
                 val o = n
                 symbol[o] = b.symbol; date[o] = b.date[i]; elapsed[o] = b.elapsed[i]; dir[o] = b.dir[i]
                 family[o] = b.family[i]; regime[o] = b.regime[i]; atr[o] = b.atr[i]; vdev[o] = b.vdev[i]
-                trend[o] = b.trend[i]; score[o] = b.score[i]
+                trend[o] = b.trend[i]; score[o] = b.score[i]; value[o] = b.value[i]
                 System.arraycopy(b.pnl, i * nk, pnl, o * nk, nk); System.arraycopy(b.reason, i * nk, reason, o * nk, nk)
                 System.arraycopy(b.closeE, i * nk, closeE, o * nk, nk)
                 for (f in 0 until nf) cols[f][o] = b.x[i * nf + f]
@@ -121,13 +126,13 @@ class Trainer(
             val c = maxOf(need, (cap * 1.25).toInt())
             symbol = symbol.copyOf(c); date = date.copyOf(c); elapsed = elapsed.copyOf(c); dir = dir.copyOf(c)
             family = family.copyOf(c); regime = regime.copyOf(c); atr = atr.copyOf(c); vdev = vdev.copyOf(c)
-            trend = trend.copyOf(c); score = score.copyOf(c)
+            trend = trend.copyOf(c); score = score.copyOf(c); value = value.copyOf(c)
             pnl = pnl.copyOf(c * nk); reason = reason.copyOf(c * nk); closeE = closeE.copyOf(c * nk)
             for (f in 0 until nf) cols[f] = cols[f].copyOf(c)
             cap = c
         }
 
-        fun cands() = Cands(n, nk, symbol, date, elapsed, dir, family, regime, atr, vdev, trend, score, pnl, reason, closeE)
+        fun cands() = Cands(n, nk, symbol, date, elapsed, dir, family, regime, atr, vdev, trend, score, value, pnl, reason, closeE)
     }
 
     /**
@@ -140,7 +145,7 @@ class Trainer(
             java.nio.file.StandardOpenOption.READ, java.nio.file.StandardOpenOption.WRITE)
         var rows = 0L; private set
 
-        private fun bytes(n: Int) = n * (4 + 2 + 3 + 16 + nf + nk * 7)
+        private fun bytes(n: Int) = n * (4 + 2 + 3 + 20 + nf + nk * 7)
 
         @Synchronized
         fun write(b: Block) {
@@ -151,7 +156,7 @@ class Trainer(
             buf.asIntBuffer().put(b.date, 0, n); buf.position(buf.position() + n * 4)
             buf.asShortBuffer().put(b.elapsed, 0, n); buf.position(buf.position() + n * 2)
             buf.put(b.dir, 0, n).put(b.family, 0, n).put(b.regime, 0, n)
-            for (a in arrayOf(b.atr, b.vdev, b.trend, b.score)) { buf.asFloatBuffer().put(a, 0, n); buf.position(buf.position() + n * 4) }
+            for (a in arrayOf(b.atr, b.vdev, b.trend, b.score, b.value)) { buf.asFloatBuffer().put(a, 0, n); buf.position(buf.position() + n * 4) }
             buf.put(b.x, 0, n * nf)
             buf.asFloatBuffer().put(b.pnl, 0, n * nk); buf.position(buf.position() + n * nk * 4)
             buf.put(b.reason, 0, n * nk)
@@ -180,7 +185,7 @@ class Trainer(
                 buf.asIntBuffer().get(b.date, 0, n); buf.position(buf.position() + n * 4)
                 buf.asShortBuffer().get(b.elapsed, 0, n); buf.position(buf.position() + n * 2)
                 buf.get(b.dir, 0, n).get(b.family, 0, n).get(b.regime, 0, n)
-                for (a in arrayOf(b.atr, b.vdev, b.trend, b.score)) { buf.asFloatBuffer().get(a, 0, n); buf.position(buf.position() + n * 4) }
+                for (a in arrayOf(b.atr, b.vdev, b.trend, b.score, b.value)) { buf.asFloatBuffer().get(a, 0, n); buf.position(buf.position() + n * 4) }
                 buf.get(b.x, 0, n * nf)
                 buf.asFloatBuffer().get(b.pnl, 0, n * nk); buf.position(buf.position() + n * nk * 4)
                 buf.get(b.reason, 0, n * nk)
@@ -203,7 +208,7 @@ class Trainer(
     private class Cands(
         val n: Int, val nk: Int, val symbol: IntArray, val date: IntArray, val elapsed: ShortArray, val dir: ByteArray,
         val family: ByteArray, val regime: ByteArray, val atr: FloatArray, val vdev: FloatArray, val trend: FloatArray,
-        val score: FloatArray, val pnl: FloatArray, val reason: ByteArray, val closeE: ShortArray,
+        val score: FloatArray, val value: FloatArray, val pnl: FloatArray, val reason: ByteArray, val closeE: ShortArray,
     ) {
         fun pnl(r: Int, k: Int) = pnl[r * nk + k]
         fun closeE(r: Int, k: Int) = closeE[r * nk + k].toInt()
@@ -220,6 +225,7 @@ class Trainer(
     data class Eval(
         val n: Int, val wins: Int, val pnl: Double, val sumRet: Double,
         val winPnl: Double = 0.0, val days: Int = 0, val ssr: Double = 0.0,
+        val sumRet2: Double = 0.0, val ssrRet: Double = 0.0,
     ) {
         val winRate get() = if (n == 0) 0.0 else wins.toDouble() / n
         val avgBp get() = if (n == 0) 0.0 else sumRet / n * 10000
@@ -237,6 +243,17 @@ class Trainer(
             val w = wilson(wins, n, 1)
             return if (days < 2) w else maxOf(w, (winRate + 1.96 * clusterSe).coerceIn(0.0, 1.0))
         }
+        /**
+         * 平均每笔利润(bp)的 95% 下限:取「按笔」与「按交易日聚类」两种标准误中较大者;只在 1 天出手时视为毫无把握。
+         */
+        val retLowBp: Double get() {
+            if (n == 0) return -1e4
+            val m = sumRet / n
+            var se = if (n > 1) sqrt(maxOf(0.0, (sumRet2 - n * m * m) / (n - 1)) / n) else kotlin.math.abs(m)
+            se = if (days >= 2) maxOf(se, sqrt(days.toDouble() / (days - 1) * ssrRet) / n) else maxOf(se, kotlin.math.abs(m))
+            return (m - 1.96 * se) * 10000
+        }
+
         /** 盈亏平衡胜率 = 平均亏损 /(平均盈利 + 平均亏损);没有亏损或没有盈利时为 NaN */
         val breakEven: Double get() {
             val losses = n - wins
@@ -244,7 +261,7 @@ class Trainer(
             val aw = winPnl / wins; val al = (winPnl - pnl) / losses
             return if (aw + al <= 0) Double.NaN else al / (aw + al)
         }
-        fun meets(target: Double, minN: Int) = n >= minN && winRate >= target && pnl > 0
+        fun meets(target: Double, minBp: Double, minN: Int) = n >= minN && winRate >= target && avgBp >= minBp && pnl > 0
     }
 
     /** 模型分数:prob 校准胜率(同一时刻多个候选时取高者);pctl 在该段模型自己近期分数中的分位(用于阈值过滤) */
@@ -276,7 +293,7 @@ class Trainer(
         val nk = grid.size
         val nf = Features.size
         if (!data.hasIndexMinutes) progress.log("提示:未找到指数 1 分钟线(sh000001.lc1),指数分时特征将为 0。")
-        progress.log("训练线程 $threads,标的 ${symbols.size} 只,特征 $nf 个,离场×挂单参数 $nk 组,目标胜率 ${pct(target)}")
+        progress.log("训练线程 $threads,标的 ${symbols.size} 只,特征 $nf 个,离场×挂单参数 $nk 组,目标:胜率 ≥ ${pct(target)} 且每笔 ≥ ${f1(minBp)}bp")
 
         // ---------- 1. 抽样确定分箱 + 内存预算 ----------
         val bt = Backtester(data, cfg)
@@ -312,7 +329,7 @@ class Trainer(
         sampleX.clear()
         // 内存预算(每个候选点):特征 nf 字节 + 每组离场 7 字节 + 属性约 30 字节
         //   + 训练期工作区(分段/两个模型概率/消融预测/标签/行号)约 100 字节;另留 30% 给并行训练的 GBDT 与 GC
-        val perCand = nf + nk * 7 + 30 + 100L
+        val perCand = nf + nk * 7 + 34 + 100L
         val estDays = sampleSetups.get().toDouble() / sampleSyms.size * symbols.size
         val estCands = estDays * sampleCands.get() / maxOf(1L, sampleDays.get())
         val budget = maxMem * 0.7 - 150e6
@@ -463,11 +480,15 @@ class Trainer(
         val valDays = dates.count { it >= valStart && it < holdStart }
         val minSearchDays = maxOf(3, Math.ceil(searchDays * 0.3).toInt())
         val minValDays = maxOf(3, Math.ceil(valDays * 0.4).toInt())
+        // 双目标:胜率 ≥ target 且 每笔利润 ≥ minBp。打分 = 两个目标"把握程度"中较差的那个:
+        //   胜率 95% 下限超出目标多少(每 5 个百分点记 1 分)、每笔利润 95% 下限超出目标多少(每 10bp 记 1 分)
+        // 只要有一个目标没把握,分数就上不去;两个都有把握时,余量越大越好
+        fun margin(e: Eval) = minOf((e.winLow - target) / 0.05, (e.retLowBp - minBp) / 10.0)
         fun fitness(e: Eval): Double = if (e.n < minTrades || e.days < minSearchDays)
-            -1.0 + 0.05 * (minOf(1.0, e.n.toDouble() / minTrades) + minOf(1.0, e.days.toDouble() / minSearchDays))
-        else e.winLow + (if (e.pnl > 0) 0.0 else -0.3) + 1e-4 * (e.sumRet / e.n) * 10000
-        fun valPass(e: Eval) = e.n >= minValTrades && e.days >= minValDays && e.winRate >= target && e.pnl > 0
-        fun valKey(e: Eval) = e.winLow + (if (e.pnl > 0) 0.0 else -0.5)
+            -1000.0 + 10 * (minOf(1.0, e.n.toDouble() / minTrades) + minOf(1.0, e.days.toDouble() / minSearchDays))
+        else margin(e)
+        fun valPass(e: Eval) = e.n >= minValTrades && e.days >= minValDays && e.winRate >= target && e.avgBp >= minBp && e.pnl > 0
+        fun valKey(e: Eval) = if (e.n == 0) -1e4 else margin(e)
 
         var pop = ArrayList<Gene>()
         // 种子:每组离场参数的"全开"策略,保证从最宽的配置起步
@@ -493,7 +514,7 @@ class Trainer(
                 val ve = evalOn(g, valRows)
                 valCache[g] = ve
                 validations++
-                val key = valKey(ve) + if (valPass(ve)) 1.0 else 0.0
+                val key = valKey(ve) + if (valPass(ve)) 1000.0 else 0.0
                 if (key > bestValKey) { bestValKey = key; bestValidated = g to ve; sinceImprove = -1 }
             }
             sinceImprove++
@@ -502,7 +523,7 @@ class Trainer(
                 bestValidated?.second)
             val bv = bestValidated?.second
             progress.step(round, "已评估 ${searchCache.size} 条 | 通过验证 $passed 条 | 最佳验证 " +
-                (if (bv == null) "-" else "${pct(bv.winRate)}(${bv.n}笔)"))
+                (if (bv == null) "-" else "${pct(bv.winRate)}/${f1(bv.avgBp)}bp(${bv.n}笔)"))
             if (passed > 0 && sinceImprove >= patience) break
             // 下一代:精英 + 精英变异 + 交叉 + 随机新个体
             val next = LinkedHashSet<Gene>(elites)
@@ -534,7 +555,8 @@ class Trainer(
             modelThr = if (finalGene.model != 0) dm.probThreshold(finalGene.spec.modelThr) else finalGene.spec.modelThr)
         val trainEnd = dates[dates.indexOf(holdStart) - 1]
         val meta = linkedMapOf(
-            "target" to target.toString(),
+            "target" to target.toString(), "minBp" to minBp.toString(),
+            "valAvgBp" to "%.2f".format(finalVal.avgBp), "testAvgBp" to "%.2f".format(finalHold.avgBp),
             "valTrades" to finalVal.n.toString(), "valWinRate" to "%.4f".format(finalVal.winRate),
             "testStart" to holdStart.toString(), "testEnd" to dates.last().toString(),
             "testTrades" to finalHold.n.toString(), "testWinRate" to "%.4f".format(finalHold.winRate),
@@ -546,7 +568,7 @@ class Trainer(
             meta, dm.calib, spec)
 
         val minutes = (System.nanoTime() - t0) / 6e10
-        val top = valCache.entries.sortedByDescending { valKey(it.value) + if (valPass(it.value)) 1 else 0 }.take(10)
+        val top = valCache.entries.sortedByDescending { valKey(it.value) + if (valPass(it.value)) 1000.0 else 0.0 }.take(10)
         val report = buildString {
             fun gtext(g: Gene) = "${cfgText(grid[g.k])} | " +
                 g.spec.copy(useModel = g.model != 0).describe("模型${"AB"[maxOf(0, g.model - 1)]}分数前${f0((1 - g.spec.modelThr) * 100)}%")
@@ -557,7 +579,8 @@ class Trainer(
             if (keep < 1.0) appendLine("- 内存限制:按「股票·交易日」随机保留 ${pct(keep)} 的数据参与训练")
             appendLine("- 指数分时数据:${if (data.hasIndexMinutes) "有" else "**无**"}")
             appendLine("- 时间切分:模型训练 < $searchStart | **寻优** $searchStart~ | **二次验证** $valStart~ | **最终验收** $holdStart~${dates.last()}(只用一次)")
-            appendLine("- 目标:胜率 ≥ ${pct(target)} 且净盈亏 > 0;寻优期至少 $minTrades 笔且分布在 $minSearchDays 个交易日以上," +
+            appendLine("- **目标(双目标)**:胜率 ≥ ${pct(target)} **且** 扣费后平均每笔 ≥ ${f1(minBp)}bp(${"%.2f%%".format(minBp / 100)})")
+            appendLine("- 样本要求:寻优期至少 $minTrades 笔且分布在 $minSearchDays 个交易日以上," +
                 "验证期至少 $minValTrades 笔且分布在 $minValDays 个交易日以上")
             appendLine("- 交易日:寻优期 $searchDays 天,验证期 $valDays 天,验收期 ${dates.count { it >= holdStart }} 天")
             appendLine("- 迭代:共 ${roundLogs.size} 轮,评估 ${searchCache.size} 条策略,二次验证 $validations 次")
@@ -566,41 +589,42 @@ class Trainer(
             appendLine()
             appendLine("最终策略:**${gtext(finalGene)}**")
             appendLine()
-            appendLine("| 数据段 | 做T次数 | 出手天数 | 胜率 | 胜率95%置信区间 | 盈亏平衡胜率 | 平均每笔(bp) | 净盈亏(元) | 达标 |")
-            appendLine("|---|---|---|---|---|---|---|---|---|")
+            appendLine("| 数据段 | 做T次数 | 出手天数 | 胜率 | 胜率95%置信区间 | 盈亏平衡胜率 | 平均每笔(bp) | 每笔95%下限(bp) | 净盈亏(元) | 达标 |")
+            appendLine("|---|---|---|---|---|---|---|---|---|---|")
             fun row(name: String, e: Eval, ok: String) = appendLine("| $name | ${e.n} | ${e.days} | ${pct(e.winRate)} | " +
                 "${if (e.n == 0) "-" else "${pct(e.winLow)}~${pct(e.winHigh)}"} | ${if (e.breakEven.isNaN()) "-" else pct(e.breakEven)} | " +
-                "${f1(e.avgBp)} | ${f0(e.pnl)} | $ok |")
-            row("寻优期(用于挑选)", finalSearch, mark(finalSearch.meets(target, minTrades)))
+                "${f1(e.avgBp)} | ${if (e.n == 0) "-" else f1(e.retLowBp)} | ${f0(e.pnl)} | $ok |")
+            row("寻优期(用于挑选)", finalSearch, mark(finalSearch.meets(target, minBp, minTrades)))
             row("二次验证期", finalVal, mark(valPass(finalVal)))
-            row("**最终验收期(样本外,只用一次)**", finalHold, mark(finalHold.meets(target, 1)))
+            row("**最终验收期(样本外,只用一次)**", finalHold, mark(finalHold.meets(target, minBp, 1)))
             row("验收期·同离场参数不加过滤", holdAll, "-")
             appendLine()
             val holdDays = dates.count { it >= holdStart }
             appendLine("> 出手频率:验收期约 ${f1(finalHold.n.toDouble() / maxOf(1, holdDays))} 笔/交易日(全部 ${symbols.size} 只合计)。")
             appendLine("> 置信区间同时考虑笔数和**交易日聚类**(同一天的交易受同一大盘影响,不是独立样本),取两者中更保守的。" +
-                "盈亏平衡胜率 = 平均亏损 ÷(平均盈利 + 平均亏损),实际胜率要明显高于它才有利润。")
+                "盈亏平衡胜率 = 平均亏损 ÷(平均盈利 + 平均亏损),实际胜率要明显高于它才有利润。" +
+                "达标 = 胜率与平均每笔两个目标同时满足且净盈亏 > 0。")
             if (!valPass(finalVal)) appendLine("> **迭代未找到通过二次验证的策略**:下表给出验证期表现最好的策略;说明在当前数据与策略空间内达不到目标。")
-            else if (!finalHold.meets(target, 1)) appendLine("> **通过了二次验证,但最终验收未达标**:说明验证期的达标有偶然成分,不能投入使用。")
+            else if (!finalHold.meets(target, minBp, 1)) appendLine("> **通过了二次验证,但最终验收未达标**:说明验证期的达标有偶然成分,不能投入使用。")
             if (finalHold.n == 0) appendLine("> **验收期没有出手**:原因见第 6 节「出手漏斗」(候选点在哪一步被过滤掉)。")
             appendLine()
             appendLine("## 1. 迭代过程")
             appendLine()
-            appendLine("| 轮次 | 累计评估 | 本轮寻优最佳(次数/胜率/95%下限) | 累计通过验证 | 最佳验证(次数/胜率) |")
+            appendLine("| 轮次 | 累计评估 | 本轮寻优最佳(次数/胜率/平均bp) | 累计通过验证 | 最佳验证(次数/胜率/平均bp) |")
             appendLine("|---|---|---|---|---|")
             for (l in roundLogs) {
                 if (l.round > 5 && l.round % 5 != 0 && l.round != roundLogs.last().round) continue
                 val bv = l.bestVal
-                appendLine("| ${l.round} | ${l.evaluated} | ${l.bestSearch.n} / ${pct(l.bestSearch.winRate)} / ${pct(l.bestSearch.winLow)} | ${l.validatedTotal} | ${if (bv == null) "-" else "${bv.n} / ${pct(bv.winRate)}"} |")
+                appendLine("| ${l.round} | ${l.evaluated} | ${l.bestSearch.n} / ${pct(l.bestSearch.winRate)} / ${f1(l.bestSearch.avgBp)} | ${l.validatedTotal} | ${if (bv == null) "-" else "${bv.n} / ${pct(bv.winRate)} / ${f1(bv.avgBp)}"} |")
             }
             appendLine()
             appendLine("## 2. 二次验证表现最好的 10 条策略")
             appendLine()
-            appendLine("| # | 策略 | 寻优期 次数/胜率 | 验证期 次数/胜率 | 验证95%下限 | 验证净盈亏 | 通过 |")
-            appendLine("|---|---|---|---|---|---|---|")
+            appendLine("| # | 策略 | 寻优期 次数/胜率/平均bp | 验证期 次数/天数/胜率/平均bp | 验证胜率95%下限 | 验证每笔95%下限(bp) | 验证净盈亏 | 通过 |")
+            appendLine("|---|---|---|---|---|---|---|---|")
             for ((i, e) in top.withIndex()) {
                 val s = searchCache.getValue(e.key); val v = e.value
-                appendLine("| ${i + 1} | ${gtext(e.key)} | ${s.n} / ${pct(s.winRate)} | ${v.n} / ${pct(v.winRate)} | ${pct(v.winLow)} | ${f0(v.pnl)} | ${mark(valPass(v))} |")
+                appendLine("| ${i + 1} | ${gtext(e.key)} | ${s.n} / ${pct(s.winRate)} / ${f1(s.avgBp)} | ${v.n} / ${v.days} / ${pct(v.winRate)} / ${f1(v.avgBp)} | ${pct(v.winLow)} | ${f1(v.retLowBp)} | ${f0(v.pnl)} | ${mark(valPass(v))} |")
             }
             appendLine()
             appendLine("## 3. 各维度单独看(寻优期 + 验证期,离场参数 = ${cfgText(grid[finalGene.k])},不加其他过滤)")
@@ -823,22 +847,26 @@ class Trainer(
     }
 
     private fun simulateGene(c: Cands, rows: IntArray, g: Gene, sc: Scores, grid: List<TConfig>): Eval {
-        var n = 0; var wins = 0; var pnl = 0.0; var sumRet = 0.0; var winPnl = 0.0
+        var n = 0; var wins = 0; var pnl = 0.0; var sumRet = 0.0; var winPnl = 0.0; var sumRet2 = 0.0
         val notional = cfg.baseValue * grid[g.k].tRatio
-        val perDay = HashMap<Int, IntArray>() // 日期 → [次数, 赢]
+        val perDay = HashMap<Int, DoubleArray>() // 日期 → [次数, 赢, 收益和]
         for (r in takenRows(c, rows, g, sc, grid)) {
             val v = c.pnl(r, g.k).toDouble()
-            val d = perDay.getOrPut(c.date[r]) { IntArray(2) }
-            n++; d[0]++
+            val ret = v / (if (c.value[r] > 0f) c.value[r].toDouble() else notional)
+            val d = perDay.getOrPut(c.date[r]) { DoubleArray(3) }
+            n++; d[0]++; d[2] += ret
             if (v > 0) { wins++; d[1]++; winPnl += v }
-            pnl += v; sumRet += v / notional
+            pnl += v; sumRet += ret; sumRet2 += ret * ret
         }
-        var ssr = 0.0
+        var ssr = 0.0; var ssrRet = 0.0
         if (n > 0) {
-            val p = wins.toDouble() / n
-            for (d in perDay.values) { val e = d[1] - p * d[0]; ssr += e * e }
+            val p = wins.toDouble() / n; val m = sumRet / n
+            for (d in perDay.values) {
+                val e = d[1] - p * d[0]; ssr += e * e
+                val er = d[2] - m * d[0]; ssrRet += er * er
+            }
         }
-        return Eval(n, wins, pnl, sumRet, winPnl, perDay.size, ssr)
+        return Eval(n, wins, pnl, sumRet, winPnl, perDay.size, ssr, sumRet2, ssrRet)
     }
 
     // ---------------- 模型训练(单段)----------------
@@ -937,6 +965,7 @@ class Trainer(
                 blk.vdev[row] = StrategySpec.vwapDevS(o, dir).toFloat()
                 blk.trend[row] = StrategySpec.withTrend(o, dir).toFloat()
                 blk.score[row] = StrategySpec.score(o, dir).toFloat()
+                blk.value[row] = 0f
                 val x = Features.extract(su.ctx, o, dir)
                 // 用与实盘完全相同的 double 值分箱(实盘按 x <= 分界值 走树)
                 for (f in 0 until nf) blk.x[row * nf + f] = BinnedData.binOf(edges[f], x[f]).toByte()
@@ -958,6 +987,7 @@ class Trainer(
                         blk.pnl[idx] = Float.NaN; blk.reason[idx] = -1; blk.closeE[idx] = -1
                     } else {
                         blk.pnl[idx] = t.netPnl(cfg.costs).toFloat()
+                        if (blk.value[row] == 0f) blk.value[row] = (t.openPrice * t.shares).toFloat()
                         blk.reason[idx] = t.closeReason.ordinal.toByte()
                         blk.closeE[idx] = Session.elapsed(t.closeMinute).toShort()
                     }
