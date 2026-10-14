@@ -36,20 +36,27 @@ data class StrategySpec(
     val modelThr: Double = 0.5,
     val maxTrades: Int = 2,
 ) {
-    fun allows(familyCode: Int, dir: TDirection, elapsed: Int, regimeOrd: Int, atrPct: Double, vwapDevS: Double, withTrend: Double): Boolean {
-        if (dirs == 1 && dir != TDirection.SELL_FIRST) return false
-        if (dirs == 2 && dir != TDirection.BUY_FIRST) return false
-        if (familyCode !in 1..4 || (families and (1 shl (familyCode - 1))) == 0) return false
-        if (elapsed < timeStart || elapsed > timeEnd) return false
-        if ((regimeMask and (1 shl regimeOrd)) == 0) return false
-        if (atrPct < atrMin || atrPct > atrMax) return false
-        if (vwapDevS < vwapDevMin) return false
-        if (withTrend < withTrendMin) return false
-        return true
+    fun allows(familyCode: Int, dir: TDirection, elapsed: Int, regimeOrd: Int, atrPct: Double, vwapDevS: Double, withTrend: Double): Boolean =
+        firstFail(familyCode, dir, elapsed, regimeOrd, atrPct, vwapDevS, withTrend) == 0
+
+    /**
+     * 第一个不满足的条件:0 全部满足;1 方向;2 信号来源;3 时间;4 大盘;5 ATR;6 均价偏离;7 顺势程度。
+     * 训练报告用它统计"出手漏斗"(候选点在哪一步被过滤掉)。
+     */
+    fun firstFail(familyCode: Int, dir: TDirection, elapsed: Int, regimeOrd: Int, atrPct: Double, vwapDevS: Double, withTrend: Double): Int {
+        if (dirs == 1 && dir != TDirection.SELL_FIRST) return 1
+        if (dirs == 2 && dir != TDirection.BUY_FIRST) return 1
+        if (familyCode !in 1..4 || (families and (1 shl (familyCode - 1))) == 0) return 2
+        if (elapsed < timeStart || elapsed > timeEnd) return 3
+        if ((regimeMask and (1 shl regimeOrd)) == 0) return 4
+        if (atrPct < atrMin || atrPct > atrMax) return 5
+        if (vwapDevS < vwapDevMin) return 6
+        if (withTrend < withTrendMin) return 7
+        return 0
     }
 
-    /** 人可读描述 */
-    fun describe(): String = buildList {
+    /** 人可读描述;[modelText] 不为空时替换默认的"模型胜率≥阈值"文字 */
+    fun describe(modelText: String? = null): String = buildList {
         add(when (dirs) { 1 -> "只先卖后买"; 2 -> "只先买后卖"; else -> "双向" })
         add("信号:" + listOf("缠论1分钟", "布林", "RSI", "缠论5分钟").filterIndexed { i, _ -> (families and (1 shl i)) != 0 }.joinToString("+"))
         add("时间:%s~%s".format(clock(timeStart), clock(timeEnd)))
@@ -57,7 +64,7 @@ data class StrategySpec(
         if (atrMin > 0 || atrMax < 1) add("ATR %.1f%%~%s".format(atrMin * 100, if (atrMax >= 1) "不限" else "%.1f%%".format(atrMax * 100)))
         if (vwapDevMin > -9) add("均价偏离≥%.2fATR".format(vwapDevMin))
         if (withTrendMin > -9) add("顺势≥%.1f".format(withTrendMin))
-        add(if (useModel) "模型胜率≥%.3f".format(modelThr) else "不用模型")
+        add(if (!useModel) "不用模型" else modelText ?: "模型胜率≥%.3f".format(modelThr))
         add("每日≤${maxTrades}次")
     }.joinToString(",")
 

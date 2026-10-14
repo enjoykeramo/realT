@@ -212,13 +212,43 @@ class Trainer(
         fun dirOf(r: Int) = if (dir[r].toInt() == 1) TDirection.SELL_FIRST else TDirection.BUY_FIRST
     }
 
-    data class Eval(val n: Int, val wins: Int, val pnl: Double, val sumRet: Double) {
+    /**
+     * 一条策略在一段数据上的表现。
+     * [days] 有出手的交易日数;[ssr] 按交易日聚类的残差平方和 Σ(赢_d − p·次数_d)²,用于"按日聚类"的置信区间:
+     * 同一天的多笔交易受同一个大盘影响、彼此相关,不能当作独立样本,只按笔数算的置信区间会偏窄。
+     */
+    data class Eval(
+        val n: Int, val wins: Int, val pnl: Double, val sumRet: Double,
+        val winPnl: Double = 0.0, val days: Int = 0, val ssr: Double = 0.0,
+    ) {
         val winRate get() = if (n == 0) 0.0 else wins.toDouble() / n
         val avgBp get() = if (n == 0) 0.0 else sumRet / n * 10000
-        val winLow: Double get() = wilson(wins, n, -1)
-        val winHigh: Double get() = wilson(wins, n, 1)
+        private val clusterSe: Double get() =
+            if (days < 2 || n == 0) Double.NaN else sqrt(days.toDouble() / (days - 1) * ssr) / n
+        /** 胜率 95% 下限:取「按笔 Wilson」与「按日聚类」两者中更保守的 */
+        val winLow: Double get() {
+            if (n == 0) return 0.0
+            val w = wilson(wins, n, -1)
+            if (days < 2) return minOf(w, 0.5 * w)
+            return minOf(w, (winRate - 1.96 * clusterSe).coerceIn(0.0, 1.0))
+        }
+        val winHigh: Double get() {
+            if (n == 0) return 0.0
+            val w = wilson(wins, n, 1)
+            return if (days < 2) w else maxOf(w, (winRate + 1.96 * clusterSe).coerceIn(0.0, 1.0))
+        }
+        /** 盈亏平衡胜率 = 平均亏损 /(平均盈利 + 平均亏损);没有亏损或没有盈利时为 NaN */
+        val breakEven: Double get() {
+            val losses = n - wins
+            if (wins == 0 || losses == 0) return Double.NaN
+            val aw = winPnl / wins; val al = (winPnl - pnl) / losses
+            return if (aw + al <= 0) Double.NaN else al / (aw + al)
+        }
         fun meets(target: Double, minN: Int) = n >= minN && winRate >= target && pnl > 0
     }
+
+    /** 模型分数:prob 校准胜率(同一时刻多个候选时取高者);pctl 在该段模型自己近期分数中的分位(用于阈值过滤) */
+    private class Scores(val prob: Array<DoubleArray>, val pctl: Array<FloatArray>)
 
     /** 一条候选策略:规则过滤 + 离场参数组 + 是否用模型(0 不用 / 1 模型A / 2 模型B) */
     data class Gene(val spec: StrategySpec, val k: Int, val model: Int)
@@ -358,65 +388,85 @@ class Trainer(
         val foldOf = IntArray(n) { r -> foldStarts.indexOfLast { c.date[r] >= it } }
         progress.log("时间切分:模型训练 ${dates.first()}~<$searchStart | 寻优 $searchStart~<$valStart | 验证 $valStart~<$holdStart | 验收 $holdStart~${dates.last()}")
 
-        // ---------- 3. 胜率模型(滚动前推,每段只用之前的数据)----------
         // 大盘环境是"同一天所有股票相同"的变量,样本只有几十天,放进模型容易记住"哪天好",改由寻优作为过滤条件并经验证期检验
-        val modelCols = (0 until nf).filter { Features.specs[it].group != FeatureGroup.MARKET }.toIntArray()
+        val baseCols = (0 until nf).filter { Features.specs[it].group != FeatureGroup.MARKET }.toIntArray()
         val modelK = intArrayOf(gridIndex(0, 1, 1), gridIndex(0, 3, 2)) // 模型A:市价/止盈0.12/止损1.0;模型B:市价/止盈0.25/止损1.6
+        val searchRows = rowsWhere(n) { foldOf[it] in 0..1 }
+        val valRows = rowsWhere(n) { foldOf[it] == 2 }
+        val holdRows = rowsWhere(n) { foldOf[it] == 3 }
+
+        // ---------- 3. 模块消融 → 选定模块组合(仅用寻优期,模型A)----------
+        // 每次去掉一组重新训练;去掉后 AUC 反而升高(超过噪声 ABL_DROP)的组判为"拖后腿",正式模型不再使用
+        data class Abl(val group: FeatureGroup, val auc: Double, val delta: Double, val dropped: Boolean)
+        val abl = ArrayList<Abl>()
+        var baseAuc = Double.NaN
+        val droppedGroups = ArrayList<FeatureGroup>()
+        if (ablation) {
+            val groups = FeatureGroup.entries.filter { it != FeatureGroup.MARKET && Features.columnsOf(it).isNotEmpty() }
+            val variants: List<FeatureGroup?> = listOf<FeatureGroup?>(null) + groups
+            val ablP = variants.associateWith { FloatArray(n) { Float.NaN } }
+            val jobs = variants.flatMap { g -> (0..1).map { f -> g to f } }
+            val doneA = AtomicInteger()
+            progress.start("3/6 模块消融", jobs.size)
+            runParallel(parallelism = modelParallelism(n), tasks = jobs.map { (g, f) ->
+                Callable {
+                    val cs = if (g == null) baseCols else baseCols.filter { Features.specs[it].group != g }.toIntArray()
+                    val fm = trainFold(bd, c, dates, foldStarts, modelK[0], f, cs, screen = true)
+                    val arr = ablP.getValue(g)
+                    for ((i, r) in fm.rows.withIndex()) arr[r] = fm.pred[i].toFloat()
+                    progress.step(doneA.incrementAndGet(), if (g == null) "全部模块 第${f + 1}段" else "去掉「${g.label}」第${f + 1}段")
+                }
+            })
+            progress.finish()
+            val baseArr = ablP.getValue(null)
+            baseAuc = auc(c, searchRows, modelK[0]) { baseArr[it].toDouble() }
+            for (g in groups) {
+                val arr = ablP.getValue(g)
+                val a = auc(c, searchRows, modelK[0]) { arr[it].toDouble() }
+                abl += Abl(g, a, a - baseAuc, a - baseAuc > ABL_DROP)
+            }
+            // 最多剔除一半的组,且至少保留 3 组
+            for (x in abl.filter { it.dropped }.sortedByDescending { it.delta }.take(maxOf(0, minOf(groups.size / 2, groups.size - 3))))
+                droppedGroups += x.group
+            if (droppedGroups.isNotEmpty()) progress.log("模块选择:剔除 ${droppedGroups.joinToString("、") { it.label }}(去掉后寻优期 AUC 反而升高)")
+        }
+        val modelCols = baseCols.filter { Features.specs[it].group !in droppedGroups }.toIntArray()
+
+        // ---------- 4. 胜率模型(滚动前推,每段只用之前的数据;用选定的模块组合)----------
         val prob = Array(2) { DoubleArray(n) { Double.NaN } }
+        val pctl = Array(2) { FloatArray(n) { Float.NaN } }
+        val sc = Scores(prob, pctl)
         val deploy = arrayOfNulls<FoldModel>(2)
         val modelImp = Array(2) { DoubleArray(nf) }
         val jobs3 = (0..1).flatMap { m -> (0 until 4).map { f -> m to f } }
         val done3 = AtomicInteger()
-        progress.start("3/6 胜率模型", jobs3.size)
+        progress.start("4/6 胜率模型", jobs3.size)
         runParallel(parallelism = modelParallelism(n), tasks = jobs3.map { (m, f) ->
             Callable {
                 val fm = trainFold(bd, c, dates, foldStarts, modelK[m], f, modelCols, screen = false)
-                for ((i, r) in fm.rows.withIndex()) prob[m][r] = fm.pred[i]
+                for ((i, r) in fm.rows.withIndex()) { prob[m][r] = fm.pred[i]; pctl[m][r] = fm.pctl(fm.pred[i]) }
                 synchronized(modelImp) { for (i in 0 until nf) modelImp[m][i] += fm.model.importance[i] }
                 if (f == 3) deploy[m] = fm
                 progress.step(done3.incrementAndGet(), "模型${"AB"[m]} 第${f + 1}段")
             }
         })
         progress.finish()
-        val searchRows = rowsWhere(n) { foldOf[it] in 0..1 }
-        val valRows = rowsWhere(n) { foldOf[it] == 2 }
-        val holdRows = rowsWhere(n) { foldOf[it] == 3 }
         val modelAuc = (0..1).map { m -> auc(c, searchRows + valRows, prob[m], modelK[m]) }
-
-        // ---------- 4. 模块消融(仅在寻优期,模型A)----------
-        val abl = ArrayList<Triple<FeatureGroup, Double, Double>>() // 组, AUC, ΔAUC
-        if (ablation) {
-            val groups = FeatureGroup.entries.filter { it != FeatureGroup.MARKET }
-            val ablP = groups.associateWith { FloatArray(n) { Float.NaN } }
-            val jobs4 = groups.flatMap { g -> (0..1).map { f -> g to f } }
-            val done4 = AtomicInteger()
-            progress.start("4/6 模块消融", jobs4.size)
-            runParallel(parallelism = modelParallelism(n), tasks = jobs4.map { (g, f) ->
-                Callable {
-                    val cs = modelCols.filter { Features.specs[it].group != g }.toIntArray()
-                    val fm = trainFold(bd, c, dates, foldStarts, modelK[0], f, cs, screen = true)
-                    val arr = ablP.getValue(g)
-                    for ((i, r) in fm.rows.withIndex()) arr[r] = fm.pred[i].toFloat()
-                    progress.step(done4.incrementAndGet(), "去掉「${g.label}」第${f + 1}段")
-                }
-            })
-            progress.finish()
-            val full = auc(c, searchRows, prob[0], modelK[0])
-            for (g in groups) {
-                val arr = ablP.getValue(g)
-                val a = auc(c, searchRows, modelK[0]) { arr[it].toDouble() }
-                abl += Triple(g, a, a - full)
-            }
-        }
 
         // ---------- 5. 迭代寻优 ----------
         val rnd = Random(seed)
         val searchCache = java.util.concurrent.ConcurrentHashMap<Gene, Eval>()
         val valCache = HashMap<Gene, Eval>()
-        fun evalOn(g: Gene, rows: IntArray) = simulateGene(c, rows, g, prob, grid)
-        fun fitness(e: Eval): Double = if (e.n < minTrades) -1.0 + 0.1 * e.n / minTrades
+        fun evalOn(g: Gene, rows: IntArray) = simulateGene(c, rows, g, sc, grid)
+        // 出手需分散在足够多的交易日上:只在少数几天出手的"高胜率"多半是碰上了好日子
+        val searchDays = dates.count { it >= searchStart && it < valStart }
+        val valDays = dates.count { it >= valStart && it < holdStart }
+        val minSearchDays = maxOf(3, Math.ceil(searchDays * 0.3).toInt())
+        val minValDays = maxOf(3, Math.ceil(valDays * 0.4).toInt())
+        fun fitness(e: Eval): Double = if (e.n < minTrades || e.days < minSearchDays)
+            -1.0 + 0.05 * (minOf(1.0, e.n.toDouble() / minTrades) + minOf(1.0, e.days.toDouble() / minSearchDays))
         else e.winLow + (if (e.pnl > 0) 0.0 else -0.3) + 1e-4 * (e.sumRet / e.n) * 10000
-        fun valPass(e: Eval) = e.n >= minValTrades && e.winRate >= target && e.pnl > 0
+        fun valPass(e: Eval) = e.n >= minValTrades && e.days >= minValDays && e.winRate >= target && e.pnl > 0
         fun valKey(e: Eval) = e.winLow + (if (e.pnl > 0) 0.0 else -0.5)
 
         var pop = ArrayList<Gene>()
@@ -478,8 +528,10 @@ class Trainer(
         progress.finish()
 
         val ec = grid[finalGene.k].copy(maxTradesPerDay = finalGene.spec.maxTrades)
-        val spec = finalGene.spec.copy(useModel = finalGene.model != 0)
         val dm = deploy[if (finalGene.model == 2) 1 else 0]!!
+        // 寻优用的是分位阈值;部署时换算成该模型的校准胜率阈值(两者对同一模型完全等价)
+        val spec = finalGene.spec.copy(useModel = finalGene.model != 0,
+            modelThr = if (finalGene.model != 0) dm.probThreshold(finalGene.spec.modelThr) else finalGene.spec.modelThr)
         val trainEnd = dates[dates.indexOf(holdStart) - 1]
         val meta = linkedMapOf(
             "target" to target.toString(),
@@ -488,6 +540,7 @@ class Trainer(
             "testTrades" to finalHold.n.toString(), "testWinRate" to "%.4f".format(finalHold.winRate),
             "testPnl" to "%.2f".format(finalHold.pnl), "symbols" to symbols.size.toString(),
             "evaluated" to searchCache.size.toString(), "validations" to validations.toString(),
+            "modelPctl" to finalGene.spec.modelThr.toString(), "droppedGroups" to droppedGroups.joinToString("/") { it.name },
         )
         val model = TradeModel(ec, cfg.costs, if (spec.useModel) spec.modelThr else 0.0, dm.model, dates.first(), trainEnd,
             meta, dm.calib, spec)
@@ -495,8 +548,8 @@ class Trainer(
         val minutes = (System.nanoTime() - t0) / 6e10
         val top = valCache.entries.sortedByDescending { valKey(it.value) + if (valPass(it.value)) 1 else 0 }.take(10)
         val report = buildString {
-            fun gtext(g: Gene) = "${cfgText(grid[g.k])} | ${g.spec.copy(useModel = g.model != 0).describe()}" +
-                (if (g.model != 0) "(模型${"AB"[g.model - 1]})" else "")
+            fun gtext(g: Gene) = "${cfgText(grid[g.k])} | " +
+                g.spec.copy(useModel = g.model != 0).describe("模型${"AB"[maxOf(0, g.model - 1)]}分数前${f0((1 - g.spec.modelThr) * 100)}%")
             appendLine("# realT 训练报告(迭代寻优)")
             appendLine()
             appendLine("- 标的 ${symbols.size} 只,交易日 ${dates.first()} ~ ${dates.last()}(${dates.size} 天),候选点 ${"%,d".format(n)},用时 ${"%.1f".format(minutes)} 分钟($threads 线程)")
@@ -504,24 +557,32 @@ class Trainer(
             if (keep < 1.0) appendLine("- 内存限制:按「股票·交易日」随机保留 ${pct(keep)} 的数据参与训练")
             appendLine("- 指数分时数据:${if (data.hasIndexMinutes) "有" else "**无**"}")
             appendLine("- 时间切分:模型训练 < $searchStart | **寻优** $searchStart~ | **二次验证** $valStart~ | **最终验收** $holdStart~${dates.last()}(只用一次)")
-            appendLine("- 目标:胜率 ≥ ${pct(target)} 且净盈亏 > 0;寻优期至少 $minTrades 笔,验证期至少 $minValTrades 笔")
+            appendLine("- 目标:胜率 ≥ ${pct(target)} 且净盈亏 > 0;寻优期至少 $minTrades 笔且分布在 $minSearchDays 个交易日以上," +
+                "验证期至少 $minValTrades 笔且分布在 $minValDays 个交易日以上")
+            appendLine("- 交易日:寻优期 $searchDays 天,验证期 $valDays 天,验收期 ${dates.count { it >= holdStart }} 天")
             appendLine("- 迭代:共 ${roundLogs.size} 轮,评估 ${searchCache.size} 条策略,二次验证 $validations 次")
             appendLine()
             appendLine("## 结论")
             appendLine()
             appendLine("最终策略:**${gtext(finalGene)}**")
             appendLine()
-            appendLine("| 数据段 | 做T次数 | 胜率 | 胜率95%置信区间 | 平均每笔(bp) | 净盈亏(元) | 达标 |")
-            appendLine("|---|---|---|---|---|---|---|")
-            appendLine("| 寻优期(用于挑选) | ${finalSearch.n} | ${pct(finalSearch.winRate)} | ${pct(finalSearch.winLow)}~${pct(finalSearch.winHigh)} | ${f1(finalSearch.avgBp)} | ${f0(finalSearch.pnl)} | ${mark(finalSearch.meets(target, minTrades))} |")
-            appendLine("| 二次验证期 | ${finalVal.n} | ${pct(finalVal.winRate)} | ${pct(finalVal.winLow)}~${pct(finalVal.winHigh)} | ${f1(finalVal.avgBp)} | ${f0(finalVal.pnl)} | ${mark(valPass(finalVal))} |")
-            appendLine("| **最终验收期(样本外,只用一次)** | ${finalHold.n} | ${pct(finalHold.winRate)} | ${pct(finalHold.winLow)}~${pct(finalHold.winHigh)} | ${f1(finalHold.avgBp)} | ${f0(finalHold.pnl)} | ${mark(finalHold.meets(target, 1))} |")
-            appendLine("| 验收期·同离场参数不加过滤 | ${holdAll.n} | ${pct(holdAll.winRate)} | - | ${f1(holdAll.avgBp)} | ${f0(holdAll.pnl)} | - |")
+            appendLine("| 数据段 | 做T次数 | 出手天数 | 胜率 | 胜率95%置信区间 | 盈亏平衡胜率 | 平均每笔(bp) | 净盈亏(元) | 达标 |")
+            appendLine("|---|---|---|---|---|---|---|---|---|")
+            fun row(name: String, e: Eval, ok: String) = appendLine("| $name | ${e.n} | ${e.days} | ${pct(e.winRate)} | " +
+                "${if (e.n == 0) "-" else "${pct(e.winLow)}~${pct(e.winHigh)}"} | ${if (e.breakEven.isNaN()) "-" else pct(e.breakEven)} | " +
+                "${f1(e.avgBp)} | ${f0(e.pnl)} | $ok |")
+            row("寻优期(用于挑选)", finalSearch, mark(finalSearch.meets(target, minTrades)))
+            row("二次验证期", finalVal, mark(valPass(finalVal)))
+            row("**最终验收期(样本外,只用一次)**", finalHold, mark(finalHold.meets(target, 1)))
+            row("验收期·同离场参数不加过滤", holdAll, "-")
             appendLine()
             val holdDays = dates.count { it >= holdStart }
             appendLine("> 出手频率:验收期约 ${f1(finalHold.n.toDouble() / maxOf(1, holdDays))} 笔/交易日(全部 ${symbols.size} 只合计)。")
+            appendLine("> 置信区间同时考虑笔数和**交易日聚类**(同一天的交易受同一大盘影响,不是独立样本),取两者中更保守的。" +
+                "盈亏平衡胜率 = 平均亏损 ÷(平均盈利 + 平均亏损),实际胜率要明显高于它才有利润。")
             if (!valPass(finalVal)) appendLine("> **迭代未找到通过二次验证的策略**:下表给出验证期表现最好的策略;说明在当前数据与策略空间内达不到目标。")
             else if (!finalHold.meets(target, 1)) appendLine("> **通过了二次验证,但最终验收未达标**:说明验证期的达标有偶然成分,不能投入使用。")
+            if (finalHold.n == 0) appendLine("> **验收期没有出手**:原因见第 6 节「出手漏斗」(候选点在哪一步被过滤掉)。")
             appendLine()
             appendLine("## 1. 迭代过程")
             appendLine()
@@ -548,7 +609,7 @@ class Trainer(
             appendLine("|---|---|---|---|---|---|")
             val sv = (searchRows + valRows).also { it.sort() }
             fun dimRow(dim: String, name: String, spec: StrategySpec) {
-                val e = simulateGene(c, sv, Gene(spec, finalGene.k, 0), prob, grid)
+                val e = simulateGene(c, sv, Gene(spec, finalGene.k, 0), sc, grid)
                 appendLine("| $dim | $name | ${e.n} | ${pct(e.winRate)} | ${f1(e.avgBp)} | ${f0(e.pnl)} |")
             }
             listOf("缠论1分钟" to 1, "布林刺破收回" to 2, "RSI拐头" to 4, "缠论5分钟" to 8).forEach { (nm, m) -> dimRow("信号来源", nm, StrategySpec(families = m)) }
@@ -563,21 +624,23 @@ class Trainer(
             appendLine("模型只作为策略的一个可选过滤条件,是否使用由寻优决定。样本外 AUC(0.5 = 随机):模型A ${"%.4f".format(modelAuc[0])},模型B ${"%.4f".format(modelAuc[1])}。")
             appendLine()
             if (abl.isNotEmpty()) {
-                appendLine("各层/模块对模型A的贡献(寻优期,去掉该组后 AUC 的变化,负值越大越重要):")
+                appendLine("各层/模块对模型A的贡献(寻优期,去掉该组重新训练后 AUC 的变化;基准 = 全部模块 ${"%.4f".format(baseAuc)})。" +
+                    "负值越大越重要;去掉后 AUC 升高超过 ${ABL_DROP} 的组判为拖后腿,正式模型不再使用:")
                 appendLine()
-                appendLine("| 去掉的层/模块 | AUC | ΔAUC |")
-                appendLine("|---|---|---|")
-                for ((g, a, d) in abl.sortedBy { it.third }) appendLine("| ${g.label} | ${"%.4f".format(a)} | ${"%+.4f".format(d)} |")
+                appendLine("| 去掉的层/模块 | AUC | ΔAUC | 正式模型 |")
+                appendLine("|---|---|---|---|")
+                for (x in abl.sortedBy { it.delta }) appendLine("| ${x.group.label} | ${"%.4f".format(x.auc)} | ${"%+.4f".format(x.delta)} | " +
+                    "${if (x.group in droppedGroups) "**剔除**" else "保留"} |")
                 appendLine()
             }
             val imp = modelImp[0]; val tot = imp.sum().takeIf { it > 0 } ?: 1.0
-            appendLine("模型A按层/模块的重要性:" + FeatureGroup.entries.filter { it != FeatureGroup.MARKET }
+            appendLine("模型A按层/模块的重要性:" + FeatureGroup.entries.filter { it != FeatureGroup.MARKET && it !in droppedGroups }
                 .associateWith { g -> Features.columnsOf(g).sumOf { imp[it] } / tot }.entries.sortedByDescending { it.value }
                 .joinToString(",") { "${it.key.label} ${pct(it.value)}" })
             appendLine()
             appendLine("## 5. 最终策略亏损单(寻优期 + 验证期)")
             appendLine()
-            val tk = takenRows(c, sv, finalGene, prob, grid)
+            val tk = takenRows(c, sv, finalGene, sc, grid)
             val losers = tk.filter { c.pnl(it, finalGene.k) <= 0 }
             appendLine("出手 ${tk.size} 笔中亏损 ${losers.size} 笔:")
             appendLine()
@@ -586,6 +649,35 @@ class Trainer(
             for ((key, g) in losers.groupBy { c.dirOf(it).label to CloseReason.entries[c.reason(it, finalGene.k)].label }
                 .toSortedMap(compareBy({ it.first }, { it.second }))) {
                 appendLine("| ${key.first} | ${key.second} | ${g.size} | ${f0(g.map { c.pnl(it, finalGene.k).toDouble() }.average())} |")
+            }
+            appendLine()
+            appendLine("## 6. 出手漏斗与大盘环境")
+            appendLine()
+            appendLine("最终策略在各段的候选点逐步被哪个条件过滤(每行是被该条件过滤掉的候选点数):")
+            appendLine()
+            appendLine("| 步骤 | 寻优期 | 验证期 | 验收期 |")
+            appendLine("|---|---|---|---|")
+            val segs = listOf(searchRows, valRows, holdRows)
+            val fails = segs.map { rows -> IntArray(10).also { cnt -> for (r in rows) cnt[failStep(c, r, finalGene, sc)]++ } }
+            val takes = segs.map { takenRows(c, it, finalGene, sc, grid).size }
+            appendLine("| 候选点总数 | ${segs.joinToString(" | ") { "%,d".format(it.size) }} |")
+            for ((code, label) in listOf(8 to "该离场参数下未成交", 1 to "方向不符", 2 to "信号来源不符", 3 to "不在时间窗",
+                    4 to "大盘环境不符", 5 to "ATR 不在范围", 6 to "均价偏离不够", 7 to "顺势程度不够", 9 to "模型分位不够"))
+                appendLine("| − $label | ${fails.joinToString(" | ") { "%,d".format(it[code]) }} |")
+            appendLine("| = 满足全部条件 | ${fails.joinToString(" | ") { "%,d".format(it[0]) }} |")
+            appendLine("| 实际出手(同一时间只持一笔、每日上限、冷却) | ${takes.joinToString(" | ")} |")
+            appendLine()
+            appendLine("各段交易日的大盘环境(大盘环境是按日判定的,整天所有股票相同):")
+            appendLine()
+            appendLine("| 大盘环境 | 寻优期(天) | 验证期(天) | 验收期(天) | 最终策略允许 |")
+            appendLine("|---|---|---|---|---|")
+            val dayRegime = HashMap<Int, Int>()
+            for (r in 0 until n) dayRegime.putIfAbsent(c.date[r], c.regime[r].toInt())
+            val segBounds = listOf(searchStart to valStart, valStart to holdStart, holdStart to Int.MAX_VALUE)
+            for (lv in MarketLevel.entries) {
+                val cnt = segBounds.map { (a, b) -> dayRegime.count { (d, rg) -> d >= a && d < b && rg == lv.ordinal } }
+                val allowed = (finalGene.spec.regimeMask and (1 shl lv.ordinal)) != 0
+                appendLine("| ${lv.label} | ${cnt.joinToString(" | ")} | ${if (allowed) "√" else "×"} |")
             }
             appendLine()
             appendLine("## 说明")
@@ -607,7 +699,8 @@ class Trainer(
     private val atrMaxs = doubleArrayOf(0.03, 0.04, 0.06, 0.08, 1.0)
     private val vdevs = doubleArrayOf(-9.0, -0.2, 0.0, 0.1, 0.2, 0.3, 0.5)
     private val trends = doubleArrayOf(-9.0, -0.5, -0.2, 0.0, 0.2, 0.4)
-    private val thrs = (0..18).map { 0.5 + it * 0.025 }.toDoubleArray()
+    /** 模型阈值(分位):0.90 表示只做模型分数排在近期前 10% 的候选点 */
+    private val thrs = doubleArrayOf(0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.97, 0.98, 0.99)
 
     private fun randomGene(r: Random, nk: Int): Gene {
         val st = starts[r.nextInt(starts.size)]
@@ -684,19 +777,24 @@ class Trainer(
         return out
     }
 
-    private fun passes(c: Cands, r: Int, g: Gene, prob: Array<DoubleArray>): Boolean {
-        if (!c.filled(r, g.k)) return false
-        if (!g.spec.allows(c.family[r].toInt(), c.dirOf(r), c.elapsed[r].toInt(), c.regime[r].toInt(),
-                c.atr[r].toDouble(), c.vdev[r].toDouble(), c.trend[r].toDouble())) return false
+    /** 候选点在哪一步被过滤:0 通过;1~7 见 [StrategySpec.firstFail];8 该离场参数下未成交;9 模型分位不够 */
+    private fun failStep(c: Cands, r: Int, g: Gene, sc: Scores): Int {
+        if (!c.filled(r, g.k)) return 8
+        val f = g.spec.firstFail(c.family[r].toInt(), c.dirOf(r), c.elapsed[r].toInt(), c.regime[r].toInt(),
+            c.atr[r].toDouble(), c.vdev[r].toDouble(), c.trend[r].toDouble())
+        if (f != 0) return f
         if (g.model != 0) {
-            val p = prob[g.model - 1][r]
-            if (p.isNaN() || p < g.spec.modelThr) return false
+            val q = sc.pctl[g.model - 1][r]
+            // 模型阈值按分位:分数在该段模型近期(早停集)分数中的位置 ≥ modelThr(寻优时 modelThr 存的是分位)
+            if (q.isNaN() || q < g.spec.modelThr - PCTL_EPS) return 9
         }
-        return true
+        return 0
     }
 
+    private fun passes(c: Cands, r: Int, g: Gene, sc: Scores): Boolean = failStep(c, r, g, sc) == 0
+
     /** 同一时刻多个候选:用模型取胜率高者,否则取 L4 综合分高者;同一时间只持一笔、每日上限、冷却 */
-    private fun takenRows(c: Cands, rows: IntArray, g: Gene, prob: Array<DoubleArray>, grid: List<TConfig>): IntArray {
+    private fun takenRows(c: Cands, rows: IntArray, g: Gene, sc: Scores, grid: List<TConfig>): IntArray {
         val out = ArrayList<Int>()
         val cool = grid[g.k].cooldownMin
         var i = 0
@@ -709,8 +807,8 @@ class Trainer(
             var j = i; var best = -1; var bestP = Double.NEGATIVE_INFINITY
             while (j < rows.size && c.symbol[rows[j]] == c.symbol[r0] && c.date[rows[j]] == c.date[r0] && c.elapsed[rows[j]].toInt() == el) {
                 val q = rows[j]
-                if (passes(c, q, g, prob)) {
-                    val pr = if (g.model != 0) prob[g.model - 1][q] else c.score[q].toDouble()
+                if (passes(c, q, g, sc)) {
+                    val pr = if (g.model != 0) sc.prob[g.model - 1][q] else c.score[q].toDouble()
                     if (pr > bestP) { bestP = pr; best = q }
                 }
                 j++
@@ -724,19 +822,45 @@ class Trainer(
         return out.toIntArray()
     }
 
-    private fun simulateGene(c: Cands, rows: IntArray, g: Gene, prob: Array<DoubleArray>, grid: List<TConfig>): Eval {
-        var n = 0; var wins = 0; var pnl = 0.0; var sumRet = 0.0
+    private fun simulateGene(c: Cands, rows: IntArray, g: Gene, sc: Scores, grid: List<TConfig>): Eval {
+        var n = 0; var wins = 0; var pnl = 0.0; var sumRet = 0.0; var winPnl = 0.0
         val notional = cfg.baseValue * grid[g.k].tRatio
-        for (r in takenRows(c, rows, g, prob, grid)) {
+        val perDay = HashMap<Int, IntArray>() // 日期 → [次数, 赢]
+        for (r in takenRows(c, rows, g, sc, grid)) {
             val v = c.pnl(r, g.k).toDouble()
-            n++; if (v > 0) wins++
+            val d = perDay.getOrPut(c.date[r]) { IntArray(2) }
+            n++; d[0]++
+            if (v > 0) { wins++; d[1]++; winPnl += v }
             pnl += v; sumRet += v / notional
         }
-        return Eval(n, wins, pnl, sumRet)
+        var ssr = 0.0
+        if (n > 0) {
+            val p = wins.toDouble() / n
+            for (d in perDay.values) { val e = d[1] - p * d[0]; ssr += e * e }
+        }
+        return Eval(n, wins, pnl, sumRet, winPnl, perDay.size, ssr)
     }
 
     // ---------------- 模型训练(单段)----------------
-    private class FoldModel(val model: Gbdt, val calib: Calibration, val rows: IntArray, val pred: DoubleArray)
+    /** [ref]:早停集(该段之前最近的交易日)上的校准分数,升序;用来把分数换算成分位 */
+    private class FoldModel(val model: Gbdt, val calib: Calibration, val rows: IntArray, val pred: DoubleArray, val ref: DoubleArray) {
+        /** 分数 x 在 ref 中的分位 = ref 中 ≤ x 的比例 */
+        fun pctl(x: Double): Float {
+            if (ref.isEmpty()) return Float.NaN
+            var lo = 0; var hi = ref.size
+            while (lo < hi) { val m = (lo + hi) ushr 1; if (ref[m] <= x) lo = m + 1 else hi = m }
+            return (lo.toDouble() / ref.size).toFloat()
+        }
+
+        /** 与"分位 ≥ q"完全等价的校准胜率阈值(部署到实盘引擎用):ref 中最小的 v,使 pctl(v) ≥ q */
+        fun probThreshold(q: Double): Double {
+            if (ref.isEmpty()) return 1.0
+            var i = (Math.ceil((q - PCTL_EPS) * ref.size).toInt() - 1).coerceIn(0, ref.size - 1)
+            while (i > 0 && pctl(ref[i - 1]) >= q - PCTL_EPS) i--
+            while (i < ref.size - 1 && pctl(ref[i]) < q - PCTL_EPS) i++
+            return if (pctl(ref[i]) >= q - PCTL_EPS) ref[i] else Math.nextUp(ref.last())
+        }
+    }
 
     private val labelCache = java.util.concurrent.ConcurrentHashMap<Int, ByteArray>()
 
@@ -761,7 +885,8 @@ class Trainer(
         val m = Gbdt.trainBinned(bd, y, tr, es, cols, gbdtParams(screen).copy(seed = 7 + k * 31 + f))
         val esScores = DoubleArray(es.size) { m.predictBinned(bd, es[it]) }
         val calib = Calibration.fit(esScores, IntArray(es.size) { y[es[it]].toInt() })
-        return FoldModel(m, calib, pr, DoubleArray(pr.size) { calib.apply(m.predictBinned(bd, pr[it])) })
+        val ref = DoubleArray(es.size) { calib.apply(esScores[it]) }.also { it.sort() }
+        return FoldModel(m, calib, pr, DoubleArray(pr.size) { calib.apply(m.predictBinned(bd, pr[it])) }, ref)
     }
 
     // ---------------- 候选生成与打标签 ----------------
@@ -900,6 +1025,9 @@ class Trainer(
         val OFFSETS = doubleArrayOf(0.0, 0.1)
         val TPS = doubleArrayOf(0.08, 0.12, 0.18, 0.25)
         val SLS = doubleArrayOf(0.6, 1.0, 1.6, 2.5)
+        private const val PCTL_EPS = 1e-6
+        /** 去掉某组后 AUC 升高超过此值,判为该组拖后腿 */
+        private const val ABL_DROP = 0.002
 
         /** 费率显示:0.00025 → 万2.5 */
         fun feeText(rate: Double): String = "万%s".format(trim(rate * 10000))
