@@ -79,7 +79,7 @@ realt.exe train --sample 200 --target 0.9 --out model1   :: 也可以指定其�
 进度在同一行刷新:
 
 ```
-[5/6 迭代寻优] ██████████░░░░░░░░░░  50%  30/60 | 已评估 9120 条 | 通过验证 12 条 | 最佳验证 96.8%(62笔) | 用时 00:21
+[5/6 迭代寻优] [##########----------]  50%  30/60 | 已评估 9120 条 | 通过验证 12 条 | 最佳验证 96.8%(62笔) | 用时 00:21
 ```
 
 输出:
@@ -144,11 +144,29 @@ engine.dist                                        // 当前分时形态概率,�
 engine.onFill(advice, fillPrice, minute)
 ```
 
+## 内存
+
+- 程序默认使用本机物理内存的 75% 作为 Java 内存上限(`-XX:MaxRAMPercentage=75`),训练开始时会显示可用上限
+- 训练先抽样估算所需内存:1000 只股票、约 90 个交易日大约需要 3GB;若超出可用内存,会**随机保留部分「股票·交易日」**
+  (整日保留)并明确提示,不会中途崩溃
+- 调整上限:免安装版编辑 `realt\app\realt.cfg` 中 `[JavaOptions]` 下的 `-XX:MaxRAMPercentage=75`(或改为 `-Xmx12g`);
+  脚本版运行前 `set JAVA_OPTS=-Xmx12g`
+
 ## 构建与测试
 
 ```bash
 ./gradlew test               # 单元测试 + 端到端测试
 ./gradlew :app:installDist   # 构建命令行工具
+```
+
+本地打包 Windows 免安装版(自带 Java 运行时,生成 `build\pkg\realt\realt.exe`):
+
+```bat
+gradle :app:installDist
+jpackage --type app-image --name realt --input app\build\install\realt\lib ^
+  --main-jar app-0.1.0.jar --main-class realt.app.MainKt ^
+  --java-options "-XX:MaxRAMPercentage=75" --java-options "-Dfile.encoding=UTF-8" ^
+  --add-modules java.base --win-console --dest build\pkg
 ```
 
 推送 `v*` 标签(例如 `v0.1.0`)会触发 GitHub Actions 构建 Windows 免安装版并发布 Release。

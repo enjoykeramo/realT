@@ -53,13 +53,19 @@ class Trainer(
         var n = 0
         var date = IntArray(cap); var elapsed = ShortArray(cap); var dir = ByteArray(cap); var family = ByteArray(cap)
         var regime = ByteArray(cap); var atr = FloatArray(cap); var vdev = FloatArray(cap); var trend = FloatArray(cap); var score = FloatArray(cap)
-        var x = FloatArray(cap * nf); var pnl = FloatArray(cap * nk); var reason = ByteArray(cap * nk); var closeE = ShortArray(cap * nk)
+        /** 特征分箱后的箱号(每值 1 字节) */
+        var x = ByteArray(cap * nf); var pnl = FloatArray(cap * nk); var reason = ByteArray(cap * nk); var closeE = ShortArray(cap * nk)
         fun ensure() {
             if (n < date.size) return
             val c = date.size * 2
             date = date.copyOf(c); elapsed = elapsed.copyOf(c); dir = dir.copyOf(c); family = family.copyOf(c)
             regime = regime.copyOf(c); atr = atr.copyOf(c); vdev = vdev.copyOf(c); trend = trend.copyOf(c); score = score.copyOf(c)
             x = x.copyOf(c * nf); pnl = pnl.copyOf(c * nk); reason = reason.copyOf(c * nk); closeE = closeE.copyOf(c * nk)
+        }
+        fun release() {
+            date = IntArray(0); elapsed = ShortArray(0); dir = ByteArray(0); family = ByteArray(0); regime = ByteArray(0)
+            atr = FloatArray(0); vdev = FloatArray(0); trend = FloatArray(0); score = FloatArray(0)
+            x = ByteArray(0); pnl = FloatArray(0); reason = ByteArray(0); closeE = ShortArray(0)
         }
     }
 
@@ -111,22 +117,66 @@ class Trainer(
         if (!data.hasIndexMinutes) progress.log("提示:未找到指数 1 分钟线(sh000001.lc1),指数分时特征将为 0。")
         progress.log("训练线程 $threads,标的 ${symbols.size} 只,特征 $nf 个,离场×挂单参数 $nk 组,目标胜率 ${pct(target)}")
 
-        // ---------- 1. 候选生成 ----------
+        // ---------- 1. 抽样确定分箱 + 内存预算 ----------
+        val bt = Backtester(data, cfg)
+        val maxMem = Runtime.getRuntime().maxMemory()
+        val sampleSyms = symbols.indices.filter { it % maxOf(1, symbols.size / 40) == 0 }.take(40)
+        val sampleX = java.util.Collections.synchronizedList(ArrayList<FloatArray>())
+        val sampleDays = AtomicLong(); val sampleCands = AtomicLong(); val sampleSetups = AtomicLong()
+        val done0 = AtomicInteger()
+        progress.start("1/6 抽样分箱", sampleSyms.size)
+        runParallel(sampleSyms.map { si ->
+            Callable {
+                val setups = bt.setups(symbols[si]).toList()
+                sampleSetups.addAndGet(setups.size.toLong())
+                // 只用每只股票前 40% 的交易日(起始训练期)计算分位点,不看后面的数据
+                for (su in setups.take((setups.size * 0.4).toInt())) {
+                    val xs = featuresOnly(su, grid[0])
+                    sampleDays.incrementAndGet(); sampleCands.addAndGet(xs.size.toLong())
+                    for (x in xs) if (sampleX.size < 300_000) sampleX += x
+                }
+                progress.step(done0.incrementAndGet())
+            }
+        })
+        require(sampleX.size >= 200) { "抽样得到的候选点太少(${sampleX.size}),请检查 1 分钟数据" }
+        val edges = Array(nf) { f ->
+            val vals = DoubleArray(sampleX.size) { sampleX[it][f].toDouble() }.also { it.sort() }
+            val e = ArrayList<Double>()
+            for (b in 1 until 64) {
+                val v = vals[(b.toLong() * (vals.size - 1) / 64).toInt()]
+                if (e.isEmpty() || v > e.last()) e += v
+            }
+            e.toDoubleArray()
+        }
+        sampleX.clear()
+        // 内存预算:每个候选点约 = 特征 nf 字节 + 每组离场 7 字节 + 属性 34 字节 + 训练期工作区
+        val perCand = nf + nk * 7 + 34 + 70 + 12L * minOf(threads, 8)
+        val estDays = sampleSetups.get().toDouble() / sampleSyms.size * symbols.size
+        val estCands = estDays * sampleCands.get() / maxOf(1L, sampleDays.get())
+        val budget = maxMem * 0.7 - 150e6
+        val keep = if (estCands * perCand <= budget) 1.0 else (budget / (estCands * perCand)).coerceIn(0.05, 1.0)
+        progress.finish("预计候选点约 ${"%,d".format(estCands.toLong())},需内存约 ${gb(estCands * perCand + 150e6)},可用上限 ${gb(maxMem.toDouble())}")
+        if (keep < 1.0) progress.log("内存不足以容纳全部数据:随机保留 ${pct(keep)} 的「股票·交易日」(整日保留,不影响当日规则)。" +
+            "若想用全部数据,请减少 --sample 或增大可用内存(见 README)。")
+
+        // ---------- 2. 候选生成(特征直接分箱存储)----------
         val blocks = java.util.Collections.synchronizedList(ArrayList<Block>())
         val dayCount = java.util.concurrent.ConcurrentHashMap<Int, Int>()
         val done = AtomicInteger(); val candCount = AtomicLong()
-        val bt = Backtester(data, cfg)
-        progress.start("1/6 候选生成", symbols.size)
+        progress.start("2/6 候选生成", symbols.size)
         runParallel(symbols.indices.map { si ->
             Callable {
                 val blk = Block(si, 1024, nf, nk)
                 try {
                     for (su in bt.setups(symbols[si])) {
-                        candidatesOf(su, grid, blk)
                         dayCount.merge(su.date, 1, Int::plus)
+                        if (keep < 1.0 && keepHash(si, su.date) >= keep) continue
+                        candidatesOf(su, grid, blk, edges)
                     }
-                } catch (e: Throwable) {
-                    progress.log("  ${symbols[si]} 失败: ${e.message}")
+                } catch (e: OutOfMemoryError) {
+                    throw e
+                } catch (e: Exception) {
+                    progress.log("  ${symbols[si]} 失败: $e")
                 }
                 blocks += blk
                 candCount.addAndGet(blk.n.toLong())
@@ -140,45 +190,14 @@ class Trainer(
         val foldStarts = listOf(0.40, 0.55, 0.70, 0.85).map { dates[(dates.size * it).toInt()] }
         val searchStart = foldStarts[0]; val valStart = foldStarts[2]; val holdStart = foldStarts[3]
 
-        // ---------- 2. 合并 + 分箱 ----------
-        progress.start("2/6 特征分箱", nf)
         val sorted = blocks.sortedBy { it.symbol }
+        blocks.clear()
         val n = sorted.sumOf { it.n }
         require(n >= 2000) { "候选点太少($n),请增加股票数量或数据天数" }
         val offs = IntArray(sorted.size + 1).also { for (i in sorted.indices) it[i + 1] = it[i] + sorted[i].n }
-        val c = merge(sorted, offs, n, nk)
-        val initRows = (0 until n).filter { c.date[it] < searchStart }
-        val edgeRows = (if (initRows.size > 300_000) initRows.shuffled(Random(1)).take(300_000) else initRows).toIntArray()
-        fun xAt(r: Int, f: Int): Double {
-            var lo = 0; var hi = sorted.size - 1
-            while (lo < hi) { val m = (lo + hi + 1) ushr 1; if (offs[m] <= r) lo = m else hi = m - 1 }
-            return sorted[lo].x[(r - offs[lo]) * nf + f].toDouble()
-        }
-        val edges = Array(nf) { f ->
-            val vals = DoubleArray(edgeRows.size) { xAt(edgeRows[it], f) }.also { it.sort() }
-            val e = ArrayList<Double>()
-            for (b in 1 until 64) {
-                if (vals.isEmpty()) break
-                val v = vals[(b.toLong() * (vals.size - 1) / 64).toInt()]
-                if (e.isEmpty() || v > e.last()) e += v
-            }
-            e.toDoubleArray()
-        }
         val cols = Array(nf) { ByteArray(n) }
-        val binDone = AtomicInteger()
-        runParallel((0 until nf).map { f ->
-            Callable {
-                val e = edges[f]; val col = cols[f]
-                for ((bi, b) in sorted.withIndex()) {
-                    val o = offs[bi]
-                    for (i in 0 until b.n) col[o + i] = BinnedData.binOf(e, b.x[i * nf + f].toDouble()).toByte()
-                }
-                progress.step(binDone.incrementAndGet())
-            }
-        })
+        val c = merge(sorted, offs, n, nk, cols) // 合并时逐块释放,避免内存翻倍
         val bd = BinnedData(edges, cols)
-        sorted.forEach { it.x = FloatArray(0) }
-        progress.finish()
         val foldOf = IntArray(n) { r -> foldStarts.indexOfLast { c.date[r] >= it } }
         progress.log("时间切分:模型训练 ${dates.first()}~<$searchStart | 寻优 $searchStart~<$valStart | 验证 $valStart~<$holdStart | 验收 $holdStart~${dates.last()}")
 
@@ -211,7 +230,7 @@ class Trainer(
         val abl = ArrayList<Triple<FeatureGroup, Double, Double>>() // 组, AUC, ΔAUC
         if (ablation) {
             val groups = FeatureGroup.entries.filter { it != FeatureGroup.MARKET }
-            val ablP = groups.associateWith { DoubleArray(n) { Double.NaN } }
+            val ablP = groups.associateWith { FloatArray(n) { Float.NaN } }
             val jobs4 = groups.flatMap { g -> (0..1).map { f -> g to f } }
             val done4 = AtomicInteger()
             progress.start("4/6 模块消融", jobs4.size)
@@ -220,13 +239,17 @@ class Trainer(
                     val cs = modelCols.filter { Features.specs[it].group != g }.toIntArray()
                     val fm = trainFold(bd, c, dates, foldStarts, modelK[0], f, cs, screen = true)
                     val arr = ablP.getValue(g)
-                    for ((i, r) in fm.rows.withIndex()) arr[r] = fm.pred[i]
+                    for ((i, r) in fm.rows.withIndex()) arr[r] = fm.pred[i].toFloat()
                     progress.step(done4.incrementAndGet(), "去掉「${g.label}」第${f + 1}段")
                 }
             })
             progress.finish()
             val full = auc(c, searchRows, prob[0], modelK[0])
-            for (g in groups) { val a = auc(c, searchRows, ablP.getValue(g), modelK[0]); abl += Triple(g, a, a - full) }
+            for (g in groups) {
+                val arr = ablP.getValue(g)
+                val a = auc(c, searchRows, DoubleArray(n) { arr[it].toDouble() }, modelK[0])
+                abl += Triple(g, a, a - full)
+            }
         }
 
         // ---------- 5. 迭代寻优 ----------
@@ -576,7 +599,32 @@ class Trainer(
     }
 
     // ---------------- 候选生成与打标签 ----------------
-    private fun candidatesOf(su: DaySetup, grid: List<TConfig>, blk: Block) {
+    /** 只算特征(抽样确定分箱用),不打标签 */
+    private fun featuresOnly(su: DaySetup, g0: TConfig): List<FloatArray> {
+        if ((su.shares * g0.tRatio / 100).toInt() <= 0) return emptyList()
+        val observer = su.observer()
+        val out = ArrayList<FloatArray>()
+        for (b in su.dayBars) {
+            val o = observer.observe(b)
+            val el = Session.elapsed(b.minute)
+            if (el < g0.noOpenAfterOpenMin || Session.MINUTES_PER_DAY - el <= g0.noOpenBeforeCloseMin) continue
+            for (dir in Features.candidates(o)) {
+                val x = Features.extract(su.ctx, o, dir)
+                out += FloatArray(x.size) { x[it].toFloat() }
+            }
+        }
+        return out
+    }
+
+    /** 按 (股票, 日期) 的确定性哈希抽样,整日保留或整日跳过 */
+    private fun keepHash(si: Int, date: Int): Double {
+        var h = si.toLong() * 1_000_003L + date
+        h = (h xor (h ushr 33)) * -0x61c8864680b583ebL
+        h = h xor (h ushr 29)
+        return (h ushr 11).toDouble() / (1L shl 53)
+    }
+
+    private fun candidatesOf(su: DaySetup, grid: List<TConfig>, blk: Block, edges: Array<DoubleArray>) {
         if ((su.shares * grid[0].tRatio / 100).toInt() <= 0) return
         val observer = su.observer()
         val bars = su.dayBars
@@ -599,7 +647,8 @@ class Trainer(
                 blk.trend[row] = StrategySpec.withTrend(o, dir).toFloat()
                 blk.score[row] = StrategySpec.score(o, dir).toFloat()
                 val x = Features.extract(su.ctx, o, dir)
-                for (f in 0 until nf) blk.x[row * nf + f] = x[f].toFloat()
+                // 用与实盘完全相同的 double 值分箱(实盘按 x <= 分界值 走树)
+                for (f in 0 until nf) blk.x[row * nf + f] = BinnedData.binOf(edges[f], x[f]).toByte()
                 for ((k, g) in grid.withIndex()) {
                     val e = TEngine(g, cfg.costs, su.ctx, su.shares, null)
                     val broker = SimBroker(e, cfg.costs.slippage)
@@ -627,7 +676,9 @@ class Trainer(
         }
     }
 
-    private fun merge(sorted: List<Block>, offs: IntArray, n: Int, nk: Int): Cands {
+    /** 合并各股票的候选点;每合并完一块立即释放它,峰值内存不翻倍 */
+    private fun merge(sorted: List<Block>, offs: IntArray, n: Int, nk: Int, cols: Array<ByteArray>): Cands {
+        val nf = cols.size
         val sym = IntArray(n); val date = IntArray(n); val el = ShortArray(n); val dir = ByteArray(n); val fam = ByteArray(n)
         val reg = ByteArray(n); val atr = FloatArray(n); val vdev = FloatArray(n); val trend = FloatArray(n); val score = FloatArray(n)
         val pnl = FloatArray(n * nk); val rsn = ByteArray(n * nk); val ce = ShortArray(n * nk)
@@ -641,6 +692,8 @@ class Trainer(
             System.arraycopy(b.score, 0, score, o, b.n)
             System.arraycopy(b.pnl, 0, pnl, o * nk, b.n * nk); System.arraycopy(b.reason, 0, rsn, o * nk, b.n * nk)
             System.arraycopy(b.closeE, 0, ce, o * nk, b.n * nk)
+            for (i in 0 until b.n) for (f in 0 until nf) cols[f][o + i] = b.x[i * nf + f]
+            b.release()
         }
         return Cands(n, nk, sym, date, el, dir, fam, reg, atr, vdev, trend, score, pnl, rsn, ce)
     }
@@ -673,6 +726,7 @@ class Trainer(
 
     private fun cfgText(g: TConfig) = "${if (g.entryOffsetAtr > 0) "挂单${g.entryOffsetAtr}ATR" else "市价"} 止盈${g.takeProfitAtr} 止损${g.stopLossAtr}"
     private fun pct(x: Double) = "%.1f%%".format(x * 100)
+    private fun gb(bytes: Double) = "%.1fGB".format(bytes / 1e9)
     private fun f0(x: Double) = "%.0f".format(x)
     private fun f1(x: Double) = "%.1f".format(x)
     private fun mark(b: Boolean) = if (b) "✔" else "✘"

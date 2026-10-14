@@ -4,7 +4,8 @@ import java.io.PrintStream
 
 /**
  * 单行进度条:同一行原地刷新(\r),例如
- *   [2/5 训练模型] ██████████░░░░░░░░░░  52%  25/48 | 离场组3 第2段 | 用时 01:12 剩余约 01:06
+ *   [3/6 胜率模型] [##########----------]  52%  25/48 | 模型A 第2段 | 用时 01:12 剩余约 01:06
+ * 进度条只用 ASCII 字符,任何 Windows 控制台代码页(GBK/UTF-8)都能正常显示。
  * 输出被重定向到文件时(无控制台),改为每 10% 打印一行。线程安全。
  */
 class Progress(
@@ -68,7 +69,7 @@ class Progress(
         val eta = if (frac > 0.01 && frac < 1) elapsed / frac * (1 - frac) else 0.0
         val barLen = 20
         val filled = (frac * barLen).toInt()
-        val bar = "█".repeat(filled) + "░".repeat(barLen - filled)
+        val bar = "[" + "#".repeat(filled) + "-".repeat(barLen - filled) + "]"
         val sb = StringBuilder()
         sb.append("[").append(stage).append("] ").append(bar).append(" %3d%%  %d/%d".format((frac * 100).toInt(), done, total))
         if (info.isNotEmpty()) sb.append(" | ").append(info)
@@ -91,6 +92,6 @@ class Progress(
         return if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s / 60 % 60, s % 60) else "%02d:%02d".format(s / 60, s % 60)
     }
 
-    /** 中文及方块字符按 2 个字符宽度计算(宁多勿少),保证覆盖上一次输出 */
-    private fun displayWidth(s: String) = s.sumOf { if (it.code >= 0x2500) 2L else 1L }.toInt()
+    /** 中文按 2 个字符宽度计算,保证覆盖上一次输出 */
+    private fun displayWidth(s: String) = s.sumOf { if (it.code >= 0x1100) 2L else 1L }.toInt()
 }

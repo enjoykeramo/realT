@@ -160,8 +160,9 @@ class Gbdt(val base: Double, val learningRate: Double, val trees: List<Tree>) {
             val margin = DoubleArray(n)
             for (r in trainRows) margin[r] = base
             for (r in esRows) margin[r] = base
-            val grad = DoubleArray(n)
-            val hess = DoubleArray(n)
+            // 梯度用 float 存储:候选点上百万时,每个并行任务省一半内存
+            val grad = FloatArray(n)
+            val hess = FloatArray(n)
             val trees = ArrayList<Tree>()
             val importance = DoubleArray(nf)
             var bestLoss = Double.MAX_VALUE
@@ -171,8 +172,8 @@ class Gbdt(val base: Double, val learningRate: Double, val trees: List<Tree>) {
             for (t in 0 until p.nTrees) {
                 for (r in trainRows) {
                     val pr = 1.0 / (1.0 + exp(-margin[r]))
-                    grad[r] = pr - y[r]
-                    hess[r] = maxOf(pr * (1 - pr), 1e-6)
+                    grad[r] = (pr - y[r]).toFloat()
+                    hess[r] = maxOf(pr * (1 - pr), 1e-6).toFloat()
                 }
                 val rows = sample(trainRows, p.rowSample, rnd)
                 val cols = feats.filter { rnd.nextDouble() < p.colSample }.ifEmpty { listOf(feats[rnd.nextInt(feats.size)]) }.toIntArray()
@@ -207,8 +208,8 @@ class Gbdt(val base: Double, val learningRate: Double, val trees: List<Tree>) {
 
     private class TreeBuilder(
         val d: BinnedData,
-        val grad: DoubleArray,
-        val hess: DoubleArray,
+        val grad: FloatArray,
+        val hess: FloatArray,
         val cols: IntArray,
         val p: Params,
         val importance: DoubleArray,

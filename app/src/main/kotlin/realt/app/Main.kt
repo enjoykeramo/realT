@@ -66,7 +66,18 @@ train 专用选项:
 配置文件位置:当前目录 realt.properties 优先,其次 用户目录\.realt\realt.properties
 """
 
+/**
+ * 输出编码:在控制台中按控制台实际代码页输出(中文 Windows 为 GBK),重定向到文件时用 UTF-8。
+ * 避免启动器未传递控制台编码时中文与进度条乱码。
+ */
+private fun setupConsole() {
+    val cs = System.console()?.charset() ?: Charsets.UTF_8
+    System.setOut(java.io.PrintStream(java.io.FileOutputStream(java.io.FileDescriptor.out), true, cs))
+    System.setErr(java.io.PrintStream(java.io.FileOutputStream(java.io.FileDescriptor.err), true, cs))
+}
+
 fun main(args: Array<String>) {
+    setupConsole()
     if (args.isEmpty() || args[0] in listOf("-h", "--help", "help")) {
         println(HELP.trimIndent()); return
     }
@@ -87,6 +98,16 @@ fun main(args: Array<String>) {
     } catch (e: IllegalArgumentException) {
         System.err.println("错误: ${e.message}")
         exitProcess(1)
+    } catch (e: Throwable) {
+        val oom = generateSequence(e) { it.cause }.any { it is OutOfMemoryError }
+        if (!oom) throw e
+        val gb = Runtime.getRuntime().maxMemory() / 1e9
+        System.err.println()
+        System.err.println("错误: 内存不足(当前 Java 可用上限 %.1fGB)。可以:".format(gb))
+        System.err.println("  1) 减少股票数,例如 --sample 300;或减少线程 --threads 4")
+        System.err.println("  2) 提高内存上限:免安装版编辑 realt\\app\\realt.cfg 中的 -XX:MaxRAMPercentage(默认 75);")
+        System.err.println("     脚本版设置环境变量 set JAVA_OPTS=-Xmx12g 后再运行")
+        exitProcess(3)
     }
 }
 
@@ -229,7 +250,7 @@ private fun train(o: Map<String, String>) {
     require(symbols.isNotEmpty()) { "没有可训练的股票(检查 1 分钟线是否已下载)" }
     val out = File(o["out"] ?: "realt-model")
     val cfg = backtestConfig(o - "model")
-    println("训练 ${symbols.size} 只股票 → ${out.absolutePath}")
+    println("训练 ${symbols.size} 只股票 → ${out.absolutePath}(Java 可用内存上限 %.1fGB)".format(Runtime.getRuntime().maxMemory() / 1e9))
     println("费率: ${describeCosts(cfg.costs)}")
     val data = MarketData(r, out, useBreadth = o["no-breadth"] == null, log = ::println)
     val target = o["target"]?.toDouble() ?: 0.95
