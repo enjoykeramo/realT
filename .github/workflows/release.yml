@@ -39,7 +39,7 @@ jobs:
           jpackage --type app-image --name realt \
             --input app/build/install/realt/lib \
             --main-jar "app-$v.jar" --main-class realt.app.MainKt \
-            --java-options "-XX:MaxRAMPercentage=75" --java-options "-Dfile.encoding=UTF-8" --add-modules java.base \
+            --java-options "-XX:MaxRAMPercentage=75" --java-options "-Dfile.encoding=UTF-8" --add-modules java.base,jdk.charsets \
             --win-console --dest build/pkg
           cp README.md build/pkg/realt/
           cd build/pkg && 7z a "../../realt-$v-windows-x64.zip" realt

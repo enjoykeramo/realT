@@ -68,14 +68,49 @@ train 专用选项:
 """
 
 /**
- * 输出编码:在控制台中按控制台实际代码页输出(中文 Windows 为 GBK),重定向到文件时用 UTF-8。
- * 避免启动器未传递控制台编码时中文与进度条乱码。
+ * 输出编码:在控制台中按控制台实际代码页输出(中文 Windows 为 936 → GBK),重定向到文件时用 UTF-8。
+ *
+ * 不能直接用 System.console().charset():Windows 把代码页 936 报告为 "ms936",
+ * 精简运行时(jpackage 只带 java.base)里没有这个名字,JDK 会退回 UTF-8,中文和进度条在 GBK 控制台里就变成问号/乱码。
+ * 这里自己把代码页号映射到 java.base 一定带有的字符集(936→GBK、65001→UTF-8 …)。
  */
+private var consoleCharset: java.nio.charset.Charset = Charsets.UTF_8
+
 private fun setupConsole() {
-    val cs = System.console()?.charset() ?: Charsets.UTF_8
-    System.setOut(java.io.PrintStream(java.io.FileOutputStream(java.io.FileDescriptor.out), true, cs))
-    System.setErr(java.io.PrintStream(java.io.FileOutputStream(java.io.FileDescriptor.err), true, cs))
+    if (System.console() != null) {
+        val names = listOfNotNull(System.getProperty("stdout.encoding"), System.getProperty("sun.stdout.encoding"))
+        consoleCharset = names.firstNotNullOfOrNull { charsetFor(it) }
+            ?: windowsCodePage()?.let { charsetFor(it.toString()) }
+            ?: System.console()?.charset() ?: Charsets.UTF_8
+    }
+    System.setOut(java.io.PrintStream(java.io.FileOutputStream(java.io.FileDescriptor.out), true, consoleCharset))
+    System.setErr(java.io.PrintStream(java.io.FileOutputStream(java.io.FileDescriptor.err), true, consoleCharset))
 }
+
+/** "ms936" / "cp936" / "x-mswin-936" / "936" / "GBK" → 字符集;优先用 java.base 自带的名字 */
+private fun charsetFor(name: String): java.nio.charset.Charset? {
+    val cp = Regex("""^(?:ms|cp|x-mswin-|windows-)?(\d+)$""", RegexOption.IGNORE_CASE).find(name.trim())?.groupValues?.get(1)?.toIntOrNull()
+    val candidates = when (cp) {
+        null -> listOf(name)
+        936 -> listOf("GBK", "GB18030")
+        54936 -> listOf("GB18030")
+        950 -> listOf("Big5", "x-windows-950")
+        65001 -> listOf("UTF-8")
+        932 -> listOf("Shift_JIS", "windows-31j")
+        949 -> listOf("EUC-KR", "x-windows-949")
+        else -> listOf("Cp$cp", "windows-$cp", "IBM$cp")
+    }
+    return candidates.firstNotNullOfOrNull { n -> runCatching { java.nio.charset.Charset.forName(n) }.getOrNull() }
+}
+
+/** 兜底:调用 chcp 读取当前控制台代码页(子进程与本进程共用同一个控制台) */
+private fun windowsCodePage(): Int? = runCatching {
+    if (!System.getProperty("os.name", "").startsWith("Windows")) return null
+    val p = ProcessBuilder("cmd", "/c", "chcp").redirectErrorStream(true).start()
+    val text = p.inputStream.readBytes().toString(Charsets.ISO_8859_1)
+    p.waitFor()
+    Regex("""(\d{3,5})""").findAll(text).lastOrNull()?.value?.toInt()
+}.getOrNull()
 
 fun main(args: Array<String>) {
     setupConsole()
@@ -121,9 +156,10 @@ private fun buildInfo(): String {
     val p = Properties()
     object {}.javaClass.getResourceAsStream("/realt/build.properties")?.use { p.load(it) }
     val commit = p.getProperty("commit", "").let { if (it.isEmpty()) "" else " $it" }
-    return "realT %s(构建 %s%s)· Java %s · 内存上限 %.1fGB · CPU %d 核".format(
+    return "realT %s(构建 %s%s)· Java %s · 内存上限 %.1fGB · CPU %d 核 · 输出编码 %s".format(
         p.getProperty("version", "dev"), p.getProperty("built", "?"), commit,
         System.getProperty("java.version"), Runtime.getRuntime().maxMemory() / 1e9, Runtime.getRuntime().availableProcessors(),
+        consoleCharset.name(),
     )
 }
 

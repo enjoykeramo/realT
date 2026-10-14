@@ -894,7 +894,7 @@ class Trainer(
     private fun gb(bytes: Double) = "%.1fGB".format(bytes / 1e9)
     private fun f0(x: Double) = "%.0f".format(x)
     private fun f1(x: Double) = "%.1f".format(x)
-    private fun mark(b: Boolean) = if (b) "✔" else "✘"
+    private fun mark(b: Boolean) = if (b) "√" else "×"
 
     companion object {
         val OFFSETS = doubleArrayOf(0.0, 0.1)

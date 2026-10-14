@@ -110,7 +110,7 @@ class ParameterSweep(
         for ((i, r) in rows.take(20).withIndex()) {
             val c = r.config
             appendLine("| ${i + 1} | ${c.entryThreshold} | ${c.takeProfitAtr} | ${c.stopLossAtr} | ${c.noOpenBeforeCloseMin} | ${c.trendBlock} | ${if (c.regimeExit) "开" else "关"} | " +
-                "${r.train.n} | ${pct(r.train.winRate)} | ${"%.0f".format(r.train.netPnl)} | ${r.test.n} | ${pct(r.test.winRate)} | ${"%.0f".format(r.test.netPnl)} | ${if (r.test.meets(target)) "✔" else "✘"} |")
+                "${r.train.n} | ${pct(r.train.winRate)} | ${"%.0f".format(r.train.netPnl)} | ${r.test.n} | ${pct(r.test.winRate)} | ${"%.0f".format(r.test.netPnl)} | ${if (r.test.meets(target)) "√" else "×"} |")
         }
         appendLine()
         appendLine("最优参数已写入 best.properties,可用 `realt backtest --params best.properties` 复用。")

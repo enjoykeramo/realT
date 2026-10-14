@@ -74,7 +74,7 @@ echo [3/4] jpackage %MAINJAR% ...
 "%JPACKAGE%" --type app-image --name realt --input "%LIB%" ^
     --main-jar "%MAINJAR%" --main-class realt.app.MainKt ^
     --java-options "-XX:MaxRAMPercentage=75" --java-options "-Dfile.encoding=UTF-8" ^
-    --add-modules java.base --win-console --dest "%STAGE%"
+    --add-modules java.base,jdk.charsets --win-console --dest "%STAGE%"
 if errorlevel 1 (
     echo [ERROR] jpackage failed, see messages above.
     goto fail

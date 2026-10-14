@@ -151,7 +151,7 @@ class Report(
             val s = TStats.of(taken.filter { it.first == sym }, costs)
             val b = TStats.of(base.filter { it.first == sym }, costs)
             if (s.meets(target)) ok++
-            appendLine("| $sym | ${records.count { it.symbol == sym }} | ${s.n} | ${pct(s.winRate)} | ${f1(s.avgRetBps)} | ${f0(s.netPnl)} | ${if (s.meets(target)) "✔" else if (s.n == 0) "-" else "✘"} | ${b.n} | ${pct(b.winRate)} | ${f0(b.netPnl)} |")
+            appendLine("| $sym | ${records.count { it.symbol == sym }} | ${s.n} | ${pct(s.winRate)} | ${f1(s.avgRetBps)} | ${f0(s.netPnl)} | ${if (s.meets(target)) "√" else if (s.n == 0) "-" else "×"} | ${b.n} | ${pct(b.winRate)} | ${f0(b.netPnl)} |")
         }
         appendLine()
         appendLine("达标股票:$ok / ${symbols.size}")
@@ -167,7 +167,7 @@ class Report(
     }
 
     private fun StringBuilder.row(name: String, s: TStats, days: Int = totalDays) {
-        appendLine("| $name | ${s.n} | ${pct(s.winRate)} | ${f1(s.avgRetBps)} | ${f0(s.netPnl)} | ${f0(s.maxLoss)} | ${"%.2f".format(s.profitFactor)} | ${pct(if (days > 0) s.daysTraded.toDouble() / days else 0.0)} | ${if (s.meets(target)) "✔" else "✘"} |")
+        appendLine("| $name | ${s.n} | ${pct(s.winRate)} | ${f1(s.avgRetBps)} | ${f0(s.netPnl)} | ${f0(s.maxLoss)} | ${"%.2f".format(s.profitFactor)} | ${pct(if (days > 0) s.daysTraded.toDouble() / days else 0.0)} | ${if (s.meets(target)) "√" else "×"} |")
     }
 
     private fun StringBuilder.group(dim: String, ts: List<Pair<Symbol, TTrade>>, key: (Pair<Symbol, TTrade>) -> String) {
