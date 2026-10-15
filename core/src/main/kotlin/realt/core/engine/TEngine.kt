@@ -32,7 +32,7 @@ enum class ActionKind(val label: String) {
 
 enum class CloseReason(val label: String) {
     TARGET("止盈"), VWAP("回归均价"), SIGNAL("反向信号"), BREAKEVEN("保本离场"), LATE_LOCK("尾盘锁利"),
-    STOP("止损认错"), REGIME_FLIP("形态逆转"), TIME("尾盘收尾"),
+    STOP("止损认错"), REGIME_FLIP("形态逆转"), TIME("尾盘收尾"), TIME_STOP("限时离场"),
 }
 
 /** 引擎给出的操作建议(实时场景下即为推送内容) */
@@ -104,6 +104,8 @@ data class TConfig(
     val entryOffsetAtr: Double = 0.0,
     /** 挂单开仓的有效分钟数 */
     val entryWaitMin: Int = 5,
+    /** 限时离场:持仓超过该分钟数仍未止盈,按市价完成T(避免拖到尾盘被迫收尾);0 关闭 */
+    val timeStopMin: Int = 0,
     /** 止盈以限价单挂出:K 线触及即按止盈价成交(否则按收盘判断、下一根开盘成交) */
     val tpLimit: Boolean = true,
     val allowSellFirst: Boolean = true,
@@ -481,6 +483,8 @@ class TEngine(
             // 均值回归目标:价格回到均价线且已覆盖成本
             gain >= minEdge && (if (sell) px <= sig.vwap else px >= sig.vwap) -> CloseReason.VWAP
             gain >= minEdge && (if (sell) sig.buyScore else sig.sellScore) >= config.exitThreshold -> CloseReason.SIGNAL
+            // 限时离场:迟迟不到止盈说明判断没兑现,不再拖到尾盘
+            config.timeStopMin > 0 && held >= config.timeStopMin -> CloseReason.TIME_STOP
             // 保本:曾经浮盈超过 2 倍 minEdge,回吐到只剩 minEdge/2 时离场,不让盈利单变亏损单
             maxGain >= 2 * minEdge && gain <= minEdge * 0.5 -> CloseReason.BREAKEVEN
             // 当日T必须当日完成:临近收盘,只要已覆盖成本就落袋,避免被迫按尾盘价收尾

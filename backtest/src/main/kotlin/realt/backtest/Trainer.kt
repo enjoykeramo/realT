@@ -272,11 +272,11 @@ class Trainer(
 
     class Result(val model: TradeModel, val report: String)
 
-    /** 离场 × 挂单参数网格(32 组),寻优在其中选择 */
+    /** 离场参数网格(32 组 = 离场方式 2 × 止盈 4 × 止损 4),寻优在其中选择 */
     fun exitGrid(base: TConfig): List<TConfig> {
         val b = base.copy(noOpenBeforeCloseMin = 20, regimeExit = false, tpLimit = true)
         return buildList {
-            for (off in OFFSETS) for (tp in TPS) for (sl in SLS) add(b.copy(entryOffsetAtr = off, takeProfitAtr = tp, stopLossAtr = sl))
+            for (hold in HOLDS) for (tp in TPS) for (sl in SLS) add(b.copy(timeStopMin = hold, takeProfitAtr = tp, stopLossAtr = sl))
         }
     }
 
@@ -293,7 +293,7 @@ class Trainer(
         val nk = grid.size
         val nf = Features.size
         if (!data.hasIndexMinutes) progress.log("提示:未找到指数 1 分钟线(sh000001.lc1),指数分时特征将为 0。")
-        progress.log("训练线程 $threads,标的 ${symbols.size} 只,特征 $nf 个,离场×挂单参数 $nk 组,目标:胜率 ≥ ${pct(target)} 且每笔 ≥ ${f1(minBp)}bp")
+        progress.log("训练线程 $threads,标的 ${symbols.size} 只,特征 $nf 个,离场参数 $nk 组,目标:胜率 ≥ ${pct(target)} 且每笔 ≥ ${f1(minBp)}bp")
 
         // ---------- 1. 抽样确定分箱 + 内存预算 ----------
         val bt = Backtester(data, cfg)
@@ -1044,7 +1044,8 @@ class Trainer(
         }
     }
 
-    private fun cfgText(g: TConfig) = "${if (g.entryOffsetAtr > 0) "挂单${g.entryOffsetAtr}ATR" else "市价"} 止盈${g.takeProfitAtr} 止损${g.stopLossAtr}"
+    private fun cfgText(g: TConfig) = "${if (g.entryOffsetAtr > 0) "挂单${g.entryOffsetAtr}ATR" else "市价"} 止盈${g.takeProfitAtr} 止损${g.stopLossAtr}" +
+        if (g.timeStopMin > 0) " 限时${g.timeStopMin}分钟" else ""
     private fun pct(x: Double) = "%.1f%%".format(x * 100)
     private fun gb(bytes: Double) = "%.1fGB".format(bytes / 1e9)
     private fun f0(x: Double) = "%.0f".format(x)
@@ -1052,7 +1053,11 @@ class Trainer(
     private fun mark(b: Boolean) = if (b) "√" else "×"
 
     companion object {
-        val OFFSETS = doubleArrayOf(0.0, 0.1)
+        /**
+         * 离场方式:0 = 持有到止盈/止损/尾盘;45 = 45 分钟内未止盈就按市价离场。
+         * (早期的"挂单 0.1ATR 开仓"在真实数据的历次训练中从未被选中,改为限时离场,参数组数保持 32)
+         */
+        val HOLDS = intArrayOf(0, 45)
         val TPS = doubleArrayOf(0.08, 0.12, 0.18, 0.25)
         val SLS = doubleArrayOf(0.6, 1.0, 1.6, 2.5)
         private const val PCTL_EPS = 1e-6

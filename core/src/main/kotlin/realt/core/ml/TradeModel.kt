@@ -101,6 +101,7 @@ class TradeModel(
             "allowSellFirst" to c.allowSellFirst.toString(),
             "allowBuyFirst" to c.allowBuyFirst.toString(),
             "entryOffsetAtr" to c.entryOffsetAtr.toString(),
+            "timeStopMin" to c.timeStopMin.toString(),
             "entryWaitMin" to c.entryWaitMin.toString(),
             "tpLimit" to c.tpLimit.toString(),
         )
@@ -131,6 +132,7 @@ class TradeModel(
                 allowSellFirst = b("allowSellFirst", base.allowSellFirst),
                 allowBuyFirst = b("allowBuyFirst", base.allowBuyFirst),
                 entryOffsetAtr = d("entryOffsetAtr", base.entryOffsetAtr),
+                timeStopMin = i("timeStopMin", base.timeStopMin),
                 entryWaitMin = i("entryWaitMin", base.entryWaitMin),
                 tpLimit = b("tpLimit", base.tpLimit),
             )
