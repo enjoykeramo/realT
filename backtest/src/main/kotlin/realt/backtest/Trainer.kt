@@ -642,6 +642,47 @@ class Trainer(
                 dimRow("时间", "${StrategySpec.clock(a)}~${StrategySpec.clock(b)}", StrategySpec(timeStart = a, timeEnd = b))
             }
             for (lv in MarketLevel.entries) dimRow("大盘", lv.label, StrategySpec(regimeMask = 1 shl lv.ordinal))
+            listOf(0.0 to 0.02, 0.02 to 0.03, 0.03 to 0.04, 0.04 to 0.06, 0.06 to 1.0).forEach { (a, b) ->
+                dimRow("个股ATR", "${f1(a * 100)}%~${if (b >= 1) "不限" else "${f1(b * 100)}%"}", StrategySpec(atrMin = a, atrMax = b))
+            }
+            // 板块:按股票代码划分(主板/创业板/科创板/北交所),看优势是否集中在某类股票
+            fun boardOf(si: Int): String {
+                val sy = symbols[si]
+                return when {
+                    sy.market == "sz" && sy.code.startsWith("30") -> "创业板"
+                    sy.market == "sh" && sy.code.startsWith("68") -> "科创板"
+                    sy.market == "bj" -> "北交所"
+                    else -> "主板"
+                }
+            }
+            val boardRows = sv.groupBy { boardOf(c.symbol[it]) }
+            for (bn in listOf("主板", "创业板", "科创板", "北交所")) {
+                val rows = boardRows[bn]?.toIntArray() ?: continue
+                val e = simulateGene(c, rows, Gene(StrategySpec(), finalGene.k, 0), sc, grid)
+                appendLine("| 板块 | $bn | ${e.n} | ${pct(e.winRate)} | ${f1(e.avgBp)} | ${f0(e.pnl)} |")
+            }
+            appendLine()
+            appendLine("### 离场参数对比(寻优期 + 验证期,不加任何过滤)")
+            appendLine()
+            val feeBp = cfg.costs.roundTripRateAt(cfg.baseValue * cfg.tConfig.tRatio) * 10000
+            appendLine("看信号本身的优势:按 T 仓 ${f0(cfg.baseValue * cfg.tConfig.tRatio)} 元计,来回费用约 ${f1(feeBp)}bp(含滑点),\"扣费前\" = 平均每笔 + 费用。" +
+                "扣费前接近 0 说明信号本身没有方向优势,过滤只是在噪声里挑。")
+            appendLine()
+            appendLine("| 离场参数 | 次数 | 胜率 | 平均每笔(bp) | 扣费前(bp) | 止盈 | 止损 | 限时离场 | 尾盘收尾 | 其他 |")
+            appendLine("|---|---|---|---|---|---|---|---|---|---|")
+            for (k in grid.indices) {
+                val g0 = Gene(StrategySpec(), k, 0)
+                val tk = takenRows(c, sv, g0, sc, grid)
+                if (tk.isEmpty()) continue
+                val e = simulateGene(c, sv, g0, sc, grid)
+                val rc = IntArray(CloseReason.entries.size)
+                for (r in tk) c.reason(r, k).let { if (it >= 0) rc[it]++ }
+                fun share(vararg rs: CloseReason) = pct(rs.sumOf { rc[it.ordinal] }.toDouble() / tk.size)
+                val other = tk.size - listOf(CloseReason.TARGET, CloseReason.STOP, CloseReason.TIME_STOP, CloseReason.TIME).sumOf { rc[it.ordinal] }
+                appendLine("| ${cfgText(grid[k])} | ${e.n} | ${pct(e.winRate)} | ${f1(e.avgBp)} | ${f1(e.avgBp + feeBp)} | " +
+                    "${share(CloseReason.TARGET)} | ${share(CloseReason.STOP)} | ${share(CloseReason.TIME_STOP)} | ${share(CloseReason.TIME)} | " +
+                    "${pct(other.toDouble() / tk.size)} |")
+            }
             appendLine()
             appendLine("## 4. 胜率模型")
             appendLine()
